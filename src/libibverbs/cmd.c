@@ -230,6 +230,14 @@ int ibv_cmd_query_device_ex(struct ibv_context *context,
 			attr->max_wq_type_rq = resp->max_wq_type_rq;
 	}
 
+	if (attr_size >= offsetof(struct ibv_device_attr_ex, raw_packet_caps) +
+			 sizeof(attr->raw_packet_caps)) {
+		if (resp->response_length >=
+		    offsetof(struct ibv_query_device_resp_ex, raw_packet_caps) +
+		    sizeof(resp->raw_packet_caps))
+			attr->raw_packet_caps = resp->raw_packet_caps;
+	}
+
 	return 0;
 }
 
@@ -918,7 +926,9 @@ static void create_qp_handle_resp_common(struct ibv_context *context,
 
 enum {
 	CREATE_QP_EX2_SUP_CREATE_FLAGS = IBV_QP_CREATE_BLOCK_SELF_MCAST_LB |
-		IBV_QP_CREATE_SCATTER_FCS,
+					 IBV_QP_CREATE_SCATTER_FCS |
+					 IBV_QP_CREATE_CVLAN_STRIPPING |
+					 IBV_QP_CREATE_SOURCE_QPN,
 };
 
 int ibv_cmd_create_qp_ex2(struct ibv_context *context,
@@ -958,6 +968,9 @@ int ibv_cmd_create_qp_ex2(struct ibv_context *context,
 				    sizeof(qp_attr->create_flags))
 			return EINVAL;
 		cmd->create_flags = qp_attr->create_flags;
+
+		if (qp_attr->create_flags & IBV_QP_CREATE_SOURCE_QPN)
+			cmd->source_qpn = qp_attr->source_qpn;
 	}
 
 	if (qp_attr->comp_mask & IBV_QP_INIT_ATTR_IND_TABLE) {
@@ -1703,6 +1716,15 @@ static int get_filters_size(struct ibv_flow_spec *ib_spec,
 		ib_spec_filter_mask = (void *)&ib_spec->ipv6.val +
 			*ib_filter_size;
 		break;
+	case IBV_FLOW_SPEC_VXLAN_TUNNEL:
+		min_filter_size =
+			offsetof(struct ibv_kern_tunnel_filter,
+				 tunnel_id) +
+			sizeof(kern_spec->tunnel.mask.tunnel_id);
+		curr_kern_filter_size = min_filter_size;
+		ib_spec_filter_mask = (void *)&ib_spec->tunnel.val +
+			*ib_filter_size;
+		break;
 	default:
 		return EINVAL;
 	}
@@ -1729,8 +1751,9 @@ static int ib_spec_to_kern_spec(struct ibv_flow_spec *ib_spec,
 
 	kern_spec->hdr.type = ib_spec->hdr.type;
 
-	switch (ib_spec->hdr.type) {
+	switch (kern_spec->hdr.type) {
 	case IBV_FLOW_SPEC_ETH:
+	case IBV_FLOW_SPEC_ETH | IBV_FLOW_SPEC_INNER:
 		kern_spec->eth.size = sizeof(struct ibv_kern_spec_eth);
 		memcpy(&kern_spec->eth.val, &ib_spec->eth.val,
 		       sizeof(struct ibv_flow_eth_filter));
@@ -1738,6 +1761,7 @@ static int ib_spec_to_kern_spec(struct ibv_flow_spec *ib_spec,
 		       sizeof(struct ibv_flow_eth_filter));
 		break;
 	case IBV_FLOW_SPEC_IPV4:
+	case IBV_FLOW_SPEC_IPV4 | IBV_FLOW_SPEC_INNER:
 		kern_spec->ipv4.size = sizeof(struct ibv_kern_spec_ipv4);
 		memcpy(&kern_spec->ipv4.val, &ib_spec->ipv4.val,
 		       sizeof(struct ibv_flow_ipv4_filter));
@@ -1745,13 +1769,15 @@ static int ib_spec_to_kern_spec(struct ibv_flow_spec *ib_spec,
 		       sizeof(struct ibv_flow_ipv4_filter));
 		break;
 	case IBV_FLOW_SPEC_IPV4_EXT:
+	case IBV_FLOW_SPEC_IPV4_EXT | IBV_FLOW_SPEC_INNER:
 		ret = get_filters_size(ib_spec, kern_spec,
 				       &ib_filter_size, &kern_filter_size,
 				       IBV_FLOW_SPEC_IPV4_EXT);
 		if (ret)
 			return ret;
 
-		kern_spec->hdr.type = IBV_FLOW_SPEC_IPV4;
+		kern_spec->hdr.type = IBV_FLOW_SPEC_IPV4 |
+				     (IBV_FLOW_SPEC_INNER & ib_spec->hdr.type);
 		kern_spec->ipv4_ext.size = sizeof(struct
 						  ibv_kern_spec_ipv4_ext);
 		memcpy(&kern_spec->ipv4_ext.val, &ib_spec->ipv4_ext.val,
@@ -1760,6 +1786,7 @@ static int ib_spec_to_kern_spec(struct ibv_flow_spec *ib_spec,
 		       + ib_filter_size, kern_filter_size);
 		break;
 	case IBV_FLOW_SPEC_IPV6:
+	case IBV_FLOW_SPEC_IPV6 | IBV_FLOW_SPEC_INNER:
 		ret = get_filters_size(ib_spec, kern_spec,
 				       &ib_filter_size, &kern_filter_size,
 				       IBV_FLOW_SPEC_IPV6);
@@ -1774,11 +1801,34 @@ static int ib_spec_to_kern_spec(struct ibv_flow_spec *ib_spec,
 		break;
 	case IBV_FLOW_SPEC_TCP:
 	case IBV_FLOW_SPEC_UDP:
+	case IBV_FLOW_SPEC_TCP | IBV_FLOW_SPEC_INNER:
+	case IBV_FLOW_SPEC_UDP | IBV_FLOW_SPEC_INNER:
 		kern_spec->tcp_udp.size = sizeof(struct ibv_kern_spec_tcp_udp);
 		memcpy(&kern_spec->tcp_udp.val, &ib_spec->tcp_udp.val,
 		       sizeof(struct ibv_flow_ipv4_filter));
 		memcpy(&kern_spec->tcp_udp.mask, &ib_spec->tcp_udp.mask,
 		       sizeof(struct ibv_flow_tcp_udp_filter));
+		break;
+	case IBV_FLOW_SPEC_VXLAN_TUNNEL:
+		ret = get_filters_size(ib_spec, kern_spec,
+				       &ib_filter_size, &kern_filter_size,
+				       IBV_FLOW_SPEC_VXLAN_TUNNEL);
+		if (ret)
+			return ret;
+
+		kern_spec->tunnel.size = sizeof(struct ibv_kern_spec_tunnel);
+		memcpy(&kern_spec->tunnel.val, &ib_spec->tunnel.val,
+		       kern_filter_size);
+		memcpy(&kern_spec->tunnel.mask, (void *)&ib_spec->tunnel.val
+		       + ib_filter_size, kern_filter_size);
+		break;
+	case IBV_FLOW_SPEC_ACTION_TAG:
+		kern_spec->flow_tag.size =
+			sizeof(struct ibv_kern_spec_action_tag);
+		kern_spec->flow_tag.tag_id = ib_spec->flow_tag.tag_id;
+		break;
+	case IBV_FLOW_SPEC_ACTION_DROP:
+		kern_spec->drop.size = sizeof(struct ibv_kern_spec_action_drop);
 		break;
 	default:
 		return EINVAL;
@@ -1886,6 +1936,15 @@ int ibv_cmd_create_wq(struct ibv_context *context,
 	cmd->max_wr = wq_init_attr->max_wr;
 	cmd->comp_mask = 0;
 
+	if (cmd_core_size >= offsetof(struct ibv_create_wq, create_flags) +
+	    sizeof(cmd->create_flags)) {
+		if (wq_init_attr->comp_mask & IBV_WQ_INIT_ATTR_FLAGS) {
+			if (wq_init_attr->create_flags & ~(IBV_WQ_FLAGS_RESERVED - 1))
+				return EOPNOTSUPP;
+			cmd->create_flags = wq_init_attr->create_flags;
+		}
+	}
+
 	err = write(context->cmd_fd, cmd, cmd_size);
 	if (err != cmd_size)
 		return errno;
@@ -1919,6 +1978,15 @@ int ibv_cmd_modify_wq(struct ibv_wq *wq, struct ibv_wq_attr *attr,
 
 	cmd->curr_wq_state = attr->curr_wq_state;
 	cmd->wq_state = attr->wq_state;
+	if (cmd_core_size >= offsetof(struct ibv_modify_wq, flags_mask) +
+	    sizeof(cmd->flags_mask)) {
+		if (attr->attr_mask & IBV_WQ_ATTR_FLAGS) {
+			if (attr->flags_mask & ~(IBV_WQ_FLAGS_RESERVED - 1))
+				return EOPNOTSUPP;
+			cmd->flags = attr->flags;
+			cmd->flags_mask = attr->flags_mask;
+		}
+	}
 	cmd->wq_handle = wq->handle;
 	cmd->attr_mask = attr->attr_mask;
 

@@ -42,6 +42,8 @@
 #include <util/udma_barrier.h>
 #include <infiniband/verbs.h>
 
+#include "mlx4dv.h"
+
 #define MLX4_PORTS_NUM 2
 
 #include <valgrind/memcheck.h>
@@ -88,33 +90,6 @@ enum mlx4_db_type {
 	MLX4_NUM_DB_TYPE
 };
 
-enum {
-	MLX4_OPCODE_NOP			= 0x00,
-	MLX4_OPCODE_SEND_INVAL		= 0x01,
-	MLX4_OPCODE_RDMA_WRITE		= 0x08,
-	MLX4_OPCODE_RDMA_WRITE_IMM	= 0x09,
-	MLX4_OPCODE_SEND		= 0x0a,
-	MLX4_OPCODE_SEND_IMM		= 0x0b,
-	MLX4_OPCODE_LSO			= 0x0e,
-	MLX4_OPCODE_RDMA_READ		= 0x10,
-	MLX4_OPCODE_ATOMIC_CS		= 0x11,
-	MLX4_OPCODE_ATOMIC_FA		= 0x12,
-	MLX4_OPCODE_MASKED_ATOMIC_CS	= 0x14,
-	MLX4_OPCODE_MASKED_ATOMIC_FA	= 0x15,
-	MLX4_OPCODE_BIND_MW		= 0x18,
-	MLX4_OPCODE_FMR			= 0x19,
-	MLX4_OPCODE_LOCAL_INVAL		= 0x1b,
-	MLX4_OPCODE_CONFIG_CMD		= 0x1f,
-
-	MLX4_RECV_OPCODE_RDMA_WRITE_IMM	= 0x00,
-	MLX4_RECV_OPCODE_SEND		= 0x01,
-	MLX4_RECV_OPCODE_SEND_IMM	= 0x02,
-	MLX4_RECV_OPCODE_SEND_INVAL	= 0x03,
-
-	MLX4_CQE_OPCODE_ERROR		= 0x1e,
-	MLX4_CQE_OPCODE_RESIZE		= 0x16,
-};
-
 struct mlx4_device {
 	struct verbs_device		verbs_dev;
 	int				page_size;
@@ -127,7 +102,6 @@ struct mlx4_context {
 	struct ibv_context		ibv_ctx;
 
 	void			       *uar;
-	pthread_spinlock_t		uar_lock;
 
 	void			       *bf_page;
 	int				bf_buf_size;
@@ -159,6 +133,8 @@ struct mlx4_context {
 		uint8_t                 offset_valid;
 	} core_clock;
 	void			       *hca_core_clock;
+	uint32_t			max_inl_recv_sz;
+	uint8_t				log_wqs_range_sz;
 };
 
 struct mlx4_buf {
@@ -175,6 +151,7 @@ enum {
 	MLX4_CQ_FLAGS_RX_CSUM_VALID = 1 << 0,
 	MLX4_CQ_FLAGS_EXTENDED = 1 << 1,
 	MLX4_CQ_FLAGS_SINGLE_THREADED = 1 << 2,
+	MLX4_CQ_FLAGS_DV_OWNED = 1 << 3,
 };
 
 struct mlx4_cq {
@@ -184,8 +161,8 @@ struct mlx4_cq {
 	pthread_spinlock_t		lock;
 	uint32_t			cqn;
 	uint32_t			cons_index;
-	uint32_t		       *set_ci_db;
-	uint32_t		       *arm_db;
+	__be32			       *set_ci_db;
+	__be32			       *arm_db;
 	int				arm_sn;
 	int				cqe_size;
 	struct mlx4_qp			*cur_qp;
@@ -204,7 +181,7 @@ struct mlx4_srq {
 	int				wqe_shift;
 	int				head;
 	int				tail;
-	uint32_t		       *db;
+	__be32			       *db;
 	uint16_t			counter;
 	uint8_t				ext_srq;
 };
@@ -221,35 +198,33 @@ struct mlx4_wq {
 	int				offset;
 };
 
+enum mlx4_rsc_type {
+	MLX4_RSC_TYPE_QP	= 0,
+	MLX4_RSC_TYPE_RSS_QP	= 1,
+	MLX4_RSC_TYPE_SRQ	= 2,
+};
+
 struct mlx4_qp {
-	struct verbs_qp			verbs_qp;
+	union {
+		struct verbs_qp		verbs_qp;
+		struct ibv_wq		wq;
+	};
 	struct mlx4_buf			buf;
 	int				max_inline_data;
 	int				buf_size;
 
-	uint32_t			doorbell_qpn;
-	uint32_t			sq_signal_bits;
+	__be32				doorbell_qpn;
+	__be32				sq_signal_bits;
 	int				sq_spare_wqes;
 	struct mlx4_wq			sq;
 
-	uint32_t		       *db;
+	__be32			       *db;
 	struct mlx4_wq			rq;
 
 	uint8_t				link_layer;
+	uint8_t				type; /* enum mlx4_rsc_type */
 	uint32_t			qp_cap_cache;
-};
-
-struct mlx4_av {
-	uint32_t			port_pd;
-	uint8_t				reserved1;
-	uint8_t				g_slid;
-	uint16_t			dlid;
-	uint8_t				reserved2;
-	uint8_t				gid_index;
-	uint8_t				stat_rate;
-	uint8_t				hop_limit;
-	uint32_t			sl_tclass_flowlabel;
-	uint8_t				dgid[16];
+	uint32_t			qpn_cache;
 };
 
 struct mlx4_ah {
@@ -264,36 +239,6 @@ enum {
 	MLX4_CSUM_SUPPORT_RAW_OVER_ETH	= (1 <<  1),
 	/* Only report rx checksum when the validation is valid */
 	MLX4_RX_CSUM_VALID		= (1 <<  16),
-};
-
-enum mlx4_cqe_status {
-	MLX4_CQE_STATUS_TCP_UDP_CSUM_OK	= (1 <<  2),
-	MLX4_CQE_STATUS_IPV4_PKT	= (1 << 22),
-	MLX4_CQE_STATUS_IP_HDR_CSUM_OK	= (1 << 28),
-	MLX4_CQE_STATUS_IPV4_CSUM_OK	= MLX4_CQE_STATUS_IPV4_PKT |
-					MLX4_CQE_STATUS_IP_HDR_CSUM_OK |
-					MLX4_CQE_STATUS_TCP_UDP_CSUM_OK
-};
-
-struct mlx4_cqe {
-	uint32_t	vlan_my_qpn;
-	uint32_t	immed_rss_invalid;
-	uint32_t	g_mlpath_rqpn;
-	union {
-		struct {
-			uint16_t	sl_vid;
-			uint16_t	rlid;
-		};
-		uint32_t ts_47_16;
-	};
-	uint32_t	status;
-	uint32_t	byte_cnt;
-	uint16_t	wqe_index;
-	uint16_t	checksum;
-	uint8_t		reserved3;
-	uint8_t		ts_15_8;
-	uint8_t		ts_7_0;
-	uint8_t		owner_sr_opcode;
 };
 
 static inline unsigned long align(unsigned long val, unsigned long align)
@@ -341,6 +286,11 @@ static inline struct mlx4_qp *to_mqp(struct ibv_qp *ibqp)
 			    struct mlx4_qp, verbs_qp);
 }
 
+static inline struct mlx4_qp *wq_to_mqp(struct ibv_wq *ibwq)
+{
+	return container_of(ibwq, struct mlx4_qp, wq);
+}
+
 static inline struct mlx4_ah *to_mah(struct ibv_ah *ibah)
 {
 	return to_mxxx(ah, ah);
@@ -351,11 +301,18 @@ static inline void mlx4_update_cons_index(struct mlx4_cq *cq)
 	*cq->set_ci_db = htobe32(cq->cons_index & 0xffffff);
 }
 
+extern int mlx4_cleanup_upon_device_fatal;
+static inline int cleanup_on_fatal(int ret)
+{
+	return (ret == EIO && mlx4_cleanup_upon_device_fatal);
+}
+
 int mlx4_alloc_buf(struct mlx4_buf *buf, size_t size, int page_size);
 void mlx4_free_buf(struct mlx4_buf *buf);
 
-uint32_t *mlx4_alloc_db(struct mlx4_context *context, enum mlx4_db_type type);
-void mlx4_free_db(struct mlx4_context *context, enum mlx4_db_type type, uint32_t *db);
+__be32 *mlx4_alloc_db(struct mlx4_context *context, enum mlx4_db_type type);
+void mlx4_free_db(struct mlx4_context *context, enum mlx4_db_type type,
+		  __be32 *db);
 
 int mlx4_query_device(struct ibv_context *context,
 		       struct ibv_device_attr *attr);
@@ -445,8 +402,9 @@ int mlx4_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 			  struct ibv_recv_wr **bad_wr);
 void mlx4_calc_sq_wqe_size(struct ibv_qp_cap *cap, enum ibv_qp_type type,
 			   struct mlx4_qp *qp);
-int mlx4_alloc_qp_buf(struct ibv_context *context, struct ibv_qp_cap *cap,
-		       enum ibv_qp_type type, struct mlx4_qp *qp);
+int mlx4_alloc_qp_buf(struct ibv_context *context, uint32_t max_recv_sge,
+		       enum ibv_qp_type type, struct mlx4_qp *qp,
+		       struct mlx4dv_qp_init_attr *mlx4qp_attr);
 void mlx4_set_sq_sizes(struct mlx4_qp *qp, struct ibv_qp_cap *cap,
 		       enum ibv_qp_type type);
 struct mlx4_qp *mlx4_find_qp(struct mlx4_context *ctx, uint32_t qpn);
@@ -457,5 +415,14 @@ int mlx4_destroy_ah(struct ibv_ah *ah);
 int mlx4_alloc_av(struct mlx4_pd *pd, struct ibv_ah_attr *attr,
 		   struct mlx4_ah *ah);
 void mlx4_free_av(struct mlx4_ah *ah);
+struct ibv_wq *mlx4_create_wq(struct ibv_context *context,
+			      struct ibv_wq_init_attr *attr);
+int mlx4_modify_wq(struct ibv_wq *wq, struct ibv_wq_attr *attr);
+int mlx4_destroy_wq(struct ibv_wq *wq);
+struct ibv_rwq_ind_table *mlx4_create_rwq_ind_table(struct ibv_context *context,
+						    struct ibv_rwq_ind_table_init_attr *init_attr);
+int mlx4_destroy_rwq_ind_table(struct ibv_rwq_ind_table *rwq_ind_table);
+int mlx4_post_wq_recv(struct ibv_wq *ibwq, struct ibv_recv_wr *wr,
+		      struct ibv_recv_wr **bad_wr);
 
 #endif /* MLX4_H */

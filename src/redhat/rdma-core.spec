@@ -1,5 +1,5 @@
 Name: rdma-core
-Version: 13
+Version: 15
 Release: 1%{?dist}
 Summary: RDMA core userspace libraries and daemons
 
@@ -20,6 +20,8 @@ BuildRequires: pkgconfig(libnl-3.0)
 BuildRequires: pkgconfig(libnl-route-3.0)
 BuildRequires: valgrind-devel
 BuildRequires: systemd
+BuildRequires: systemd-devel
+BuildRequires: python
 
 Requires: dracut, kmod, systemd
 # Red Hat/Fedora previously shipped redhat/ as a stand-alone
@@ -181,7 +183,7 @@ Summary: Userspace RDMA Connection Manager
 Requires: %{name}%{?_isa} = %{version}-%{release}
 
 %description -n librdmacm
-librdmacm provides a userspace RDMA Communication Managment API.
+librdmacm provides a userspace RDMA Communication Management API.
 
 %package -n librdmacm-utils
 Summary: Examples for the librdmacm library
@@ -255,28 +257,20 @@ install -D -m0644 redhat/rdma.mlx4.conf %{buildroot}/%{_sysconfdir}/rdma/mlx4.co
 install -D -m0755 redhat/rdma.ifup-ib %{buildroot}/%{_sysconfdir}/sysconfig/network-scripts/ifup-ib
 install -D -m0755 redhat/rdma.ifdown-ib %{buildroot}/%{_sysconfdir}/sysconfig/network-scripts/ifdown-ib
 install -D -m0644 redhat/rdma.service %{buildroot}%{_unitdir}/rdma.service
-install -D -m0644 redhat/rdma.udev-ipoib-naming.rules %{buildroot}%{_sysconfdir}/udev/rules.d/70-persistent-ipoib.rules
-install -D -m0644 redhat/rdma.mlx4.user.modprobe %{buildroot}%{_sysconfdir}/modprobe.d/mlx4.conf
 install -D -m0755 redhat/rdma.modules-setup.sh %{buildroot}%{dracutlibdir}/modules.d/05rdma/module-setup.sh
 install -D -m0644 redhat/rdma.udev-rules %{buildroot}%{_udevrulesdir}/98-rdma.rules
 install -D -m0644 redhat/rdma.mlx4.sys.modprobe %{buildroot}%{sysmodprobedir}/libmlx4.conf
-install -D -m0644 redhat/rdma.cxgb3.sys.modprobe %{buildroot}%{sysmodprobedir}/cxgb3.conf
-install -D -m0644 redhat/rdma.cxgb4.sys.modprobe %{buildroot}%{sysmodprobedir}/cxgb4.conf
 install -D -m0755 redhat/rdma.kernel-init %{buildroot}%{_libexecdir}/rdma-init-kernel
 install -D -m0755 redhat/rdma.sriov-init %{buildroot}%{_libexecdir}/rdma-set-sriov-vf
-install -D -m0644 redhat/rdma.fixup-mtrr.awk %{buildroot}%{_libexecdir}/rdma-fixup-mtrr.awk
 install -D -m0755 redhat/rdma.mlx4-setup.sh %{buildroot}%{_libexecdir}/mlx4-setup.sh
 
 # ibacm
 bin/ib_acme -D . -O
 install -D -m0644 ibacm_opts.cfg %{buildroot}%{_sysconfdir}/rdma/
-install -D -m0644 redhat/ibacm.service %{buildroot}%{_unitdir}/
-
-# srp_daemon
-install -D -m0644 redhat/srp_daemon.service %{buildroot}%{_unitdir}/
 
 # Delete the package's init.d scripts
 rm -rf %{buildroot}/%{_initrddir}/
+rm -rf %{buildroot}/%{_sbindir}/srp_daemon.sh
 
 # libibverbs
 %post -n libibverbs -p /sbin/ldconfig
@@ -322,31 +316,50 @@ rm -rf %{buildroot}/%{_initrddir}/
 %dir %{_sysconfdir}/rdma
 %dir %{_docdir}/%{name}-%{version}
 %doc %{_docdir}/%{name}-%{version}/README.md
-%config(noreplace) %{_sysconfdir}/rdma/*
+%doc %{_docdir}/%{name}-%{version}/rxe.md
+%doc %{_docdir}/%{name}-%{version}/udev.md
+%config(noreplace) %{_sysconfdir}/rdma/mlx4.conf
+%config(noreplace) %{_sysconfdir}/rdma/modules/infiniband.conf
+%config(noreplace) %{_sysconfdir}/rdma/modules/iwarp.conf
+%config(noreplace) %{_sysconfdir}/rdma/modules/opa.conf
+%config(noreplace) %{_sysconfdir}/rdma/modules/rdma.conf
+%config(noreplace) %{_sysconfdir}/rdma/modules/roce.conf
+%config(noreplace) %{_sysconfdir}/rdma/rdma.conf
+%config(noreplace) %{_sysconfdir}/rdma/sriov-vfs
 %config(noreplace) %{_sysconfdir}/udev/rules.d/*
 %config(noreplace) %{_sysconfdir}/modprobe.d/mlx4.conf
 %config(noreplace) %{_sysconfdir}/modprobe.d/truescale.conf
 %{_sysconfdir}/sysconfig/network-scripts/*
+%{_unitdir}/rdma-hw.target
+%{_unitdir}/rdma-load-modules@.service
 %{_unitdir}/rdma.service
 %dir %{dracutlibdir}/modules.d/05rdma
 %{dracutlibdir}/modules.d/05rdma/module-setup.sh
-%{_udevrulesdir}/*
+%{_udevrulesdir}/60-rdma-ndd.rules
+%{_udevrulesdir}/75-rdma-description.rules
+%{_udevrulesdir}/90-rdma-hw-modules.rules
+%{_udevrulesdir}/90-rdma-ulp-modules.rules
+%{_udevrulesdir}/90-rdma-umad.rules
+%{_udevrulesdir}/98-rdma.rules
 %{sysmodprobedir}/libmlx4.conf
-%{sysmodprobedir}/cxgb3.conf
-%{sysmodprobedir}/cxgb4.conf
 %{_libexecdir}/rdma-init-kernel
 %{_libexecdir}/rdma-set-sriov-vf
-%{_libexecdir}/rdma-fixup-mtrr.awk
 %{_libexecdir}/mlx4-setup.sh
 %{_libexecdir}/truescale-serdes.cmds
+%{_bindir}/rxe_cfg
 %{_sbindir}/rdma-ndd
 %{_unitdir}/rdma-ndd.service
+%{_mandir}/man7/rxe*
 %{_mandir}/man8/rdma-ndd.*
+%{_mandir}/man8/rxe*
 %license COPYING.*
 
 %files devel
 %doc %{_docdir}/%{name}-%{version}/MAINTAINERS
-%{_includedir}/*
+%dir %{_includedir}/infiniband
+%dir %{_includedir}/rdma
+%{_includedir}/infiniband/*
+%{_includedir}/rdma/*
 %{_libdir}/lib*.so
 %{_mandir}/man3/ibv_*
 %{_mandir}/man3/rdma*
@@ -354,20 +367,19 @@ rm -rf %{buildroot}/%{_initrddir}/
 %{_mandir}/man3/*_to_ibv_rate.*
 %{_mandir}/man7/rdma_cm.*
 %{_mandir}/man3/mlx5dv*
+%{_mandir}/man3/mlx4dv*
 %{_mandir}/man7/mlx5dv*
+%{_mandir}/man7/mlx4dv*
 
 %files -n libibverbs
 %dir %{_sysconfdir}/libibverbs.d
 %dir %{_libdir}/libibverbs
 %{_libdir}/libibverbs*.so.*
 %{_libdir}/libibverbs/*.so
-%{_libdir}/libmlx5.so*
+%{_libdir}/libmlx5.so.*
+%{_libdir}/libmlx4.so.*
 %config(noreplace) %{_sysconfdir}/libibverbs.d/*.driver
 %doc %{_docdir}/%{name}-%{version}/libibverbs.md
-%doc %{_docdir}/%{name}-%{version}/rxe.md
-%{_bindir}/rxe_cfg
-%{_mandir}/man7/rxe*
-%{_mandir}/man8/rxe*
 
 %files -n libibverbs-utils
 %{_bindir}/ibv_*
@@ -382,15 +394,18 @@ rm -rf %{buildroot}/%{_initrddir}/
 %{_mandir}/man7/ibacm.*
 %{_mandir}/man7/ibacm_prov.*
 %{_unitdir}/ibacm.service
+%{_unitdir}/ibacm.socket
 %dir %{_libdir}/ibacm
 %{_libdir}/ibacm/*
 %doc %{_docdir}/%{name}-%{version}/ibacm.md
 
 %files -n iwpmd
-%{_bindir}/iwpmd
+%{_sbindir}/iwpmd
 %{_unitdir}/iwpmd.service
+%config(noreplace) %{_sysconfdir}/rdma/modules/iwpmd.conf
 %config(noreplace) %{_sysconfdir}/iwpmd.conf
-%{_mandir}/man1/iwpmd.*
+%{_udevrulesdir}/90-iwpmd.rules
+%{_mandir}/man8/iwpmd.*
 %{_mandir}/man5/iwpmd.*
 
 %files -n libibcm
@@ -421,6 +436,7 @@ rm -rf %{buildroot}/%{_initrddir}/
 %{_bindir}/ucmatose
 %{_bindir}/udaddy
 %{_bindir}/udpong
+%{_mandir}/man1/cmtime.*
 %{_mandir}/man1/mckey.*
 %{_mandir}/man1/rcopy.*
 %{_mandir}/man1/rdma_client.*
@@ -432,14 +448,20 @@ rm -rf %{buildroot}/%{_initrddir}/
 %{_mandir}/man1/rstream.*
 %{_mandir}/man1/ucmatose.*
 %{_mandir}/man1/udaddy.*
+%{_mandir}/man1/udpong.*
 
 %files -n srp_daemon
 %config(noreplace) %{_sysconfdir}/srp_daemon.conf
+%config(noreplace) %{_sysconfdir}/rdma/modules/srp_daemon.conf
+%{_libexecdir}/srp_daemon/start_on_all_ports
 %{_unitdir}/srp_daemon.service
+%{_unitdir}/srp_daemon_port@.service
 %{_sbindir}/ibsrpdm
 %{_sbindir}/srp_daemon
-%{_sbindir}/srp_daemon.sh
 %{_sbindir}/run_srp_daemon
+%{_udevrulesdir}/60-srp_daemon.rules
 %{_mandir}/man1/ibsrpdm.1*
 %{_mandir}/man1/srp_daemon.1*
+%{_mandir}/man5/srp_daemon.service.5*
+%{_mandir}/man5/srp_daemon_port@.service.5*
 %doc %{_docdir}/%{name}-%{version}/ibsrpdm.md

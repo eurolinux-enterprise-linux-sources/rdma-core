@@ -50,8 +50,12 @@ struct mlx5_eqe_qp_srq {
 	uint32_t	qp_srq_n;
 };
 
+struct mlx5_wqe_eth_pad {
+	uint8_t rsvd0[16];
+};
+
 struct mlx5_wqe_xrc_seg {
-	uint32_t	xrc_srqn;
+	__be32		xrc_srqn;
 	uint8_t		rsvd[12];
 };
 
@@ -63,6 +67,8 @@ struct mlx5_wqe_masked_atomic_seg {
 };
 
 enum {
+	MLX5_IPOIB_INLINE_MIN_HEADER_SIZE	= 4,
+	MLX5_SOURCE_QPN_INLINE_MAX_HEADER_SIZE	= 18,
 	MLX5_ETH_L2_INLINE_HEADER_SIZE	= 18,
 	MLX5_ETH_L2_MIN_HEADER_SIZE	= 14,
 };
@@ -89,17 +95,17 @@ enum {
 struct mlx5_wqe_umr_ctrl_seg {
 	uint8_t		flags;
 	uint8_t		rsvd0[3];
-	uint16_t	klm_octowords;
-	uint16_t	translation_offset;
-	uint64_t	mkey_mask;
+	__be16		klm_octowords;
+	__be16		translation_offset;
+	__be64		mkey_mask;
 	uint8_t		rsvd1[32];
 };
 
 struct mlx5_wqe_umr_klm_seg {
 	/* up to 2GB */
-	uint32_t	byte_count;
-	uint32_t	mkey;
-	uint64_t	address;
+	__be32		byte_count;
+	__be32		mkey;
+	__be64		address;
 };
 
 union mlx5_wqe_umr_inline_seg {
@@ -123,17 +129,17 @@ struct mlx5_wqe_mkey_context_seg {
 	uint8_t		reserved1;
 	uint8_t		access_flags;
 	uint8_t		sf;
-	uint32_t	qpn_mkey;
-	uint32_t	reserved2;
-	uint32_t	flags_pd;
-	uint64_t	start_addr;
-	uint64_t	len;
-	uint32_t	bsf_octword_size;
-	uint32_t	reserved3[4];
-	uint32_t	translations_octword_size;
+	__be32		qpn_mkey;
+	__be32		reserved2;
+	__be32		flags_pd;
+	__be64		start_addr;
+	__be64		len;
+	__be32		bsf_octword_size;
+	__be32		reserved3[4];
+	__be32		translations_octword_size;
 	uint8_t		reserved4[3];
 	uint8_t		log_page_size;
-	uint32_t	reserved;
+	__be32		reserved;
 	union mlx5_wqe_umr_inline_seg inseg[0];
 };
 
@@ -183,7 +189,7 @@ struct mlx5_wqe_signature_seg {
 };
 
 struct mlx5_wqe_inline_seg {
-	uint32_t	byte_count;
+	__be32		byte_count;
 };
 
 

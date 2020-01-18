@@ -16,6 +16,7 @@ rdma_sbin_executable(ibacm
 target_link_libraries(ibacm LINK_PRIVATE
   ibverbs
   ibumad
+  ${SYSTEMD_LIBRARIES}
   ${CMAKE_THREAD_LIBS_INIT}
   ${CMAKE_DL_LIBS}
   )
@@ -38,9 +39,7 @@ set_target_properties(ibacmp PROPERTIES
 install(TARGETS ibacmp DESTINATION "${ACM_PROVIDER_DIR}")
 # ACM providers are linked into a subdir so that IN_PLACE can work.
 file(MAKE_DIRECTORY "${BUILD_LIB}/ibacm/")
-execute_process(COMMAND "${CMAKE_COMMAND}" -E create_symlink
-    "../libibacmp.so"
-    "${BUILD_LIB}/ibacm/libibacmp.so")
+rdma_create_symlink("../libibacmp.so" "${BUILD_LIB}/ibacm/libibacmp.so")
 
 rdma_executable(ib_acme
   src/acme.c
@@ -60,9 +59,17 @@ rdma_man_pages(
   )
 
 # FIXME: update the .init.in
-set(rdmascript "openibd")
-set(prefix "${CMAKE_INSTALL_PREFIX}")
 rdma_subst_install(FILES "ibacm.init.in"
   DESTINATION "${CMAKE_INSTALL_INITDDIR}"
   RENAME "ibacm"
   PERMISSIONS OWNER_WRITE OWNER_READ GROUP_READ WORLD_READ OWNER_EXECUTE GROUP_EXECUTE WORLD_EXECUTE)
+
+rdma_subst_install(FILES "ibacm.service.in"
+  DESTINATION "${CMAKE_INSTALL_SYSTEMD_SERVICEDIR}"
+  RENAME ibacm.service
+  PERMISSIONS OWNER_WRITE OWNER_READ GROUP_READ WORLD_READ)
+
+install(FILES "ibacm.socket"
+  DESTINATION "${CMAKE_INSTALL_SYSTEMD_SERVICEDIR}"
+  RENAME ibacm.socket
+  PERMISSIONS OWNER_WRITE OWNER_READ GROUP_READ WORLD_READ)

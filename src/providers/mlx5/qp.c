@@ -37,10 +37,10 @@
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
+#include <util/mmio.h>
 #include <util/compiler.h>
 
 #include "mlx5.h"
-#include "doorbell.h"
 #include "wqe.h"
 
 #define MLX5_ATOMIC_SIZE 8
@@ -236,32 +236,27 @@ static void set_data_ptr_seg_atomic(struct mlx5_wqe_data_seg *dseg,
  * implementations may use move-string-buffer assembler instructions,
  * which do not guarantee order of copying.
  */
-static void mlx5_bf_copy(unsigned long long *dst, unsigned long long *src,
-			 unsigned bytecnt, struct mlx5_qp *qp)
+static void mlx5_bf_copy(uint64_t *dst, const uint64_t *src, unsigned bytecnt,
+			 struct mlx5_qp *qp)
 {
-	while (bytecnt > 0) {
-		*dst++ = *src++;
-		*dst++ = *src++;
-		*dst++ = *src++;
-		*dst++ = *src++;
-		*dst++ = *src++;
-		*dst++ = *src++;
-		*dst++ = *src++;
-		*dst++ = *src++;
-		bytecnt -= 8 * sizeof(unsigned long long);
+	do {
+		mmio_memcpy_x64(dst, src, 64);
+		bytecnt -= 64;
+		dst += 8;
+		src += 8;
 		if (unlikely(src == qp->sq.qend))
 			src = qp->sq_start;
-	}
+	} while (bytecnt > 0);
 }
 
-static uint32_t send_ieth(struct ibv_send_wr *wr)
+static __be32 send_ieth(struct ibv_send_wr *wr)
 {
 	switch (wr->opcode) {
 	case IBV_WR_SEND_WITH_IMM:
 	case IBV_WR_RDMA_WRITE_WITH_IMM:
 		return wr->imm_data;
 	case IBV_WR_SEND_WITH_INV:
-		return htobe32(wr->imm_data);
+		return htobe32(wr->invalidate_rkey);
 	default:
 		return 0;
 	}
@@ -317,7 +312,7 @@ static uint8_t wq_sig(struct mlx5_wqe_ctrl_seg *ctrl)
 }
 
 #ifdef MLX5_DEBUG
-void dump_wqe(FILE *fp, int idx, int size_16, struct mlx5_qp *qp)
+static void dump_wqe(FILE *fp, int idx, int size_16, struct mlx5_qp *qp)
 {
 	uint32_t *uninitialized_var(p);
 	int i, j;
@@ -413,7 +408,7 @@ static inline int copy_eth_inline_headers(struct ibv_qp *ibqp,
 
 #define ALIGN(x, log_a) ((((x) + (1 << (log_a)) - 1)) & ~((1 << (log_a)) - 1))
 
-static inline uint16_t get_klm_octo(int nentries)
+static inline __be16 get_klm_octo(int nentries)
 {
 	return htobe16(ALIGN(nentries, 3) / 2);
 }
@@ -609,6 +604,63 @@ static inline int set_tso_eth_seg(void **seg, struct ibv_send_wr *wr,
 	return 0;
 }
 
+static inline int mlx5_post_send_underlay(struct mlx5_qp *qp, struct ibv_send_wr *wr,
+					  void **pseg, int *total_size,
+					  struct mlx5_sg_copy_ptr *sg_copy_ptr)
+{
+	struct mlx5_wqe_eth_seg *eseg;
+	int inl_hdr_copy_size;
+	void *seg = *pseg;
+	int size = 0;
+
+	if (unlikely(wr->opcode == IBV_WR_SEND_WITH_IMM))
+		return EINVAL;
+
+	memset(seg, 0, sizeof(struct mlx5_wqe_eth_pad));
+	size += sizeof(struct mlx5_wqe_eth_pad);
+	seg += sizeof(struct mlx5_wqe_eth_pad);
+	eseg = seg;
+	*((uint64_t *)eseg) = 0;
+	eseg->rsvd2 = 0;
+
+	if (wr->send_flags & IBV_SEND_IP_CSUM) {
+		if (!(qp->qp_cap_cache & MLX5_CSUM_SUPPORT_UNDERLAY_UD))
+			return EINVAL;
+
+		eseg->cs_flags |= MLX5_ETH_WQE_L3_CSUM | MLX5_ETH_WQE_L4_CSUM;
+	}
+
+	if (likely(wr->sg_list[0].length >= MLX5_SOURCE_QPN_INLINE_MAX_HEADER_SIZE))
+		/* Copying the minimum required data unless inline mode is set */
+		inl_hdr_copy_size = (wr->send_flags & IBV_SEND_INLINE) ?
+				MLX5_SOURCE_QPN_INLINE_MAX_HEADER_SIZE :
+				MLX5_IPOIB_INLINE_MIN_HEADER_SIZE;
+	else {
+		inl_hdr_copy_size = MLX5_IPOIB_INLINE_MIN_HEADER_SIZE;
+		/* We expect at least 4 bytes as part of first entry to hold the IPoIB header */
+		if (unlikely(wr->sg_list[0].length < inl_hdr_copy_size))
+			return EINVAL;
+	}
+
+	memcpy(eseg->inline_hdr_start, (void *)(uintptr_t)wr->sg_list[0].addr,
+	       inl_hdr_copy_size);
+	eseg->inline_hdr_sz = htobe16(inl_hdr_copy_size);
+	size += sizeof(struct mlx5_wqe_eth_seg);
+	seg += sizeof(struct mlx5_wqe_eth_seg);
+
+	/* If we copied all the sge into the inline-headers, then we need to
+	 * start copying from the next sge into the data-segment.
+	 */
+	if (unlikely(wr->sg_list[0].length == inl_hdr_copy_size))
+		sg_copy_ptr->index++;
+	else
+		sg_copy_ptr->offset = inl_hdr_copy_size;
+
+	*pseg = seg;
+	*total_size += (size / 16);
+	return 0;
+}
+
 static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				  struct ibv_send_wr **bad_wr)
 {
@@ -742,7 +794,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				struct ibv_mw_bind_info	bind_info = {};
 
 				next_fence = MLX5_WQE_CTRL_INITIATOR_SMALL_FENCE;
-				ctrl->imm = htobe32(wr->imm_data);
+				ctrl->imm = htobe32(wr->invalidate_rkey);
 				err = set_bind_wr(qp, IBV_MW_TYPE_2, 0,
 						  &bind_info, ibqp->qp_num,
 						  &seg, &size);
@@ -787,7 +839,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				struct ibv_mw_bind_info	bind_info = {};
 
 				next_fence = MLX5_WQE_CTRL_INITIATOR_SMALL_FENCE;
-				ctrl->imm = htobe32(wr->imm_data);
+				ctrl->imm = htobe32(wr->invalidate_rkey);
 				err = set_bind_wr(qp, IBV_MW_TYPE_2, 0,
 						  &bind_info, ibqp->qp_num,
 						  &seg, &size);
@@ -811,6 +863,14 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			size += sizeof(struct mlx5_wqe_datagram_seg) / 16;
 			if (unlikely((seg == qend)))
 				seg = mlx5_get_send_wqe(qp, 0);
+
+			if (unlikely(qp->flags & MLX5_QP_FLAGS_USE_UNDERLAY)) {
+				err = mlx5_post_send_underlay(qp, wr, &seg, &size, &sg_copy_ptr);
+				if (unlikely(err)) {
+					*bad_wr = wr;
+					goto out;
+				}
+			}
 			break;
 
 		case IBV_QPT_RAW_PACKET:
@@ -939,11 +999,10 @@ out:
 		if (!ctx->shut_up_bf && nreq == 1 && bf->uuarn &&
 		    (inl || ctx->prefer_bf) && size > 1 &&
 		    size <= bf->buf_size / 16)
-			mlx5_bf_copy(bf->reg + bf->offset, (unsigned long long *)ctrl,
+			mlx5_bf_copy(bf->reg + bf->offset, (uint64_t *)ctrl,
 				     align(size * 16, 64), qp);
 		else
-			mlx5_write64((__be32 *)ctrl, bf->reg + bf->offset,
-				     &ctx->lock32);
+			mmio_write64_be(bf->reg + bf->offset, *(__be64 *)ctrl);
 
 		/*
 		 * use mmio_flush_writes() to ensure write combining buffers are flushed out
@@ -1205,7 +1264,8 @@ out:
 		 * This is only for Raw Packet QPs since they are represented
 		 * differently in the hardware.
 		 */
-		if (likely(!(ibqp->qp_type == IBV_QPT_RAW_PACKET &&
+		if (likely(!((ibqp->qp_type == IBV_QPT_RAW_PACKET ||
+			      qp->flags & MLX5_QP_FLAGS_USE_UNDERLAY) &&
 			     ibqp->state < IBV_QPS_RTR)))
 			qp->db[MLX5_RCV_DBR] = htobe32(qp->rq.head & 0xffff);
 	}

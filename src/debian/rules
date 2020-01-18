@@ -23,17 +23,21 @@ override_dh_auto_configure:
 			-DCMAKE_INSTALL_SYSTEMD_SERVICEDIR:PATH=/lib/systemd/system \
 			-DCMAKE_INSTALL_INITDDIR:PATH=/etc/init.d \
 			-DCMAKE_INSTALL_LIBEXECDIR:PATH=/usr/lib \
+			-DCMAKE_INSTALL_SHAREDSTATEDIR:PATH=/var/lib \
+			-DCMAKE_INSTALL_RUNDIR:PATH=/run \
 			-DCMAKE_INSTALL_UDEV_RULESDIR:PATH=/lib/udev/rules.d
 
 override_dh_auto_build:
 	ninja -C build-deb -v
 
+# upstream does not ship test cases
+override_dh_auto_test:
+
 override_dh_auto_install:
 	DESTDIR=$(CURDIR)/debian/tmp ninja -C build-deb install
 
-# The following files are not used on Debian
-# FIXME: should they be?
-INST_EXCLUDE := "etc/rsyslog.d/srp_daemon.conf" \
+# The following files are not used on Debian (we ship our own sysvinit script)
+INST_EXCLUDE := "etc/init.d/srpd" \
 		"usr/sbin/run_srp_daemon" \
 		"usr/sbin/srp_daemon.sh"
 INST_EXCLUDE := $(addprefix -X,$(INST_EXCLUDE))
@@ -44,8 +48,7 @@ override_dh_install:
 # pre-postrms
 override_dh_installinit:
 	dh_installinit -pibacm --onlyscripts
-	dh_installinit -piwpmd --onlyscripts
-	dh_installinit -psrptools --onlyscripts
+	dh_installinit -prdma-core --onlyscripts --name=iwpmd
 	dh_installinit --remaining-packages
 
 # Provider plugin libaries are not shared libraries and do not belong in the
@@ -56,14 +59,11 @@ SHLIBS_EXCLUDE := $(addprefix --exclude=,$(SHLIBS_EXCLUDE))
 override_dh_makeshlibs:
 	dh_makeshlibs $(SHLIBS_EXCLUDE)
 
-# Create dbg packages.
-# FIXME: should we just have a rdma-core-dbg package ?
 override_dh_strip:
 	dh_strip -plibibcm1 --dbg-package=libibcm1-dbg
 	dh_strip -plibibumad3 --dbg-package=libibumad3-dbg
 	dh_strip -plibibverbs1 --dbg-package=libibverbs1-dbg
 	dh_strip -plibrdmacm1 --dbg-package=librdmacm1-dbg
-
 	dh_strip --remaining-packages
 
 # Upstream encourages the use of 'build' as the developer build output

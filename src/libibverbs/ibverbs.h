@@ -42,14 +42,6 @@
 
 #define INIT		__attribute__((constructor))
 
-#define DEFAULT_ABI	"IBVERBS_1.1"
-
-#define symver(name, api, ver) asm(".symver " #name "," #api "@" #ver)
-#define default_symver(name, api)                                              \
-	asm(".symver " #name "," #api "@@" DEFAULT_ABI)
-#define private_symver(name, api)                                              \
-	asm(".symver " #name "," #api "@@IBVERBS_PRIVATE_13")
-
 #define PFX		"libibverbs: "
 
 struct ibv_abi_compat_v2 {
@@ -59,7 +51,10 @@ struct ibv_abi_compat_v2 {
 
 extern int abi_ver;
 
-int ibverbs_init(struct ibv_device ***list);
+int ibverbs_get_device_list(struct list_head *list);
+int ibverbs_init(void);
+void ibverbs_device_put(struct ibv_device *dev);
+void ibverbs_device_hold(struct ibv_device *dev);
 
 struct verbs_ex_private {
 	struct ibv_cq_ex *(*create_cq_ex)(struct ibv_context *context,

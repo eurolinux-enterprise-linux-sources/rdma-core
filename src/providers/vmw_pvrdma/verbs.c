@@ -154,12 +154,7 @@ static int is_multicast_gid(const union ibv_gid *gid)
 
 static int is_link_local_gid(const union ibv_gid *gid)
 {
-	uint32_t *hi = (uint32_t *)(gid->raw);
-	uint32_t *lo = (uint32_t *)(gid->raw + 4);
-	if (hi[0] == htobe32(0xfe800000) && lo[0] == 0)
-		return 1;
-
-	return 0;
+	return gid->global.subnet_prefix == htobe64(0xfe80000000000000ULL);
 }
 
 static int is_ipv6_addr_v4mapped(const struct in6_addr *a)
@@ -171,7 +166,7 @@ static int is_ipv6_addr_v4mapped(const struct in6_addr *a)
 		 (a->s6_addr32[2] ^ htobe32(0x0000ffff))) == 0UL));
 }
 
-static void set_mac_from_gid(const union ibv_gid *gid,
+static int set_mac_from_gid(const union ibv_gid *gid,
 			     __u8 mac[6])
 {
 	if (is_link_local_gid(gid)) {
@@ -182,7 +177,11 @@ static void set_mac_from_gid(const union ibv_gid *gid,
 		memcpy(mac, gid->raw + 8, 3);
 		memcpy(mac + 3, gid->raw + 13, 3);
 		mac[0] ^= 2;
+
+		return 0;
 	}
+
+	return 1;
 }
 
 struct ibv_ah *pvrdma_create_ah(struct ibv_pd *pd,
@@ -191,6 +190,7 @@ struct ibv_ah *pvrdma_create_ah(struct ibv_pd *pd,
 	struct pvrdma_ah *ah;
 	struct pvrdma_av *av;
 	struct ibv_port_attr port_attr;
+	uint16_t vlan_id;
 
 	if (!attr->is_global)
 		return NULL;
@@ -221,9 +221,18 @@ struct ibv_ah *pvrdma_create_ah(struct ibv_pd *pd,
 	av->sl_tclass_flowlabel = (attr->grh.traffic_class << 20) |
 				   attr->grh.flow_label;
 	memcpy(av->dgid, attr->grh.dgid.raw, 16);
-	set_mac_from_gid(&attr->grh.dgid, av->dmac);
 
-	return &ah->ibv_ah;
+	if (port_attr.port_cap_flags & IBV_PORT_IP_BASED_GIDS) {
+		if (!ibv_resolve_eth_l2_from_gid(pd->context, attr,
+						 av->dmac, &vlan_id))
+			return &ah->ibv_ah;
+	} else {
+		if (!set_mac_from_gid(&attr->grh.dgid, av->dmac))
+			return &ah->ibv_ah;
+	}
+
+	free(ah);
+	return NULL;
 }
 
 int pvrdma_destroy_ah(struct ibv_ah *ah)

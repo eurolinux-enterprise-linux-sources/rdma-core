@@ -39,65 +39,21 @@
 #include <stdint.h>
 #include <signal.h>
 #include <endian.h>
+#include <util/util.h>
 #include <infiniband/verbs.h>
 #include <infiniband/umad.h>
 #include <linux/types.h>	/* __be16, __be32 and __be64 */
+#include <ccan/build_assert.h>
 
 #include "config.h"
 #include "srp_ib_types.h"
 
-#ifdef __cplusplus
-template <bool b> struct vki_static_assert { int m_bitfield:(2*b-1); };
-#define STATIC_ASSERT(expr) \
-	(void)(sizeof(vki_static_assert<(expr)>) - sizeof(int))
-#else
-#define STATIC_ASSERT(expr) (void)(sizeof(struct { int:-!(expr); }))
-#endif
-
-/* a CMP b. See also the BSD macro timercmp(). */
-#define ts_cmp(a, b, CMP)			\
-	(((a)->tv_sec == (b)->tv_sec) ?		\
-	 ((a)->tv_nsec CMP (b)->tv_nsec) :	\
-	 ((a)->tv_sec CMP (b)->tv_sec))
-
 #define SRP_CATAS_ERR SIGUSR1
 
 enum {
-	SRP_MGMT_CLASS_SA = 3,
-	SRP_MGMT_CLASS_DM = 6
-};
-
-enum {
-	SRP_MGMT_CLASS_SA_VERSION = 2,
-};
-
-enum {
-        SRP_SA_RMPP_VERSION = 1,
-};
-
-
-enum {
-	SRP_MAD_ATTR_CLASS_PORT_INFO 	  = 0x0001,
-	SRP_MAD_ATTR_NOTICE	  	  = 0x0002,
-	SRP_MAD_ATTR_INFORM_INFO	  = 0x0003,
-
-	SRP_SA_ATTR_NODE		  = 0x0011,
-	SRP_SA_ATTR_PORT_INFO		  = 0x0012,
-	SRP_SA_ATTR_PATH_REC		  = 0x0035,
-
 	SRP_DM_ATTR_IO_UNIT_INFO    	  = 0x0010,
 	SRP_DM_ATTR_IO_CONTROLLER_PROFILE = 0x0011,
 	SRP_DM_ATTR_SERVICE_ENTRIES       = 0x0012
-};
-
-enum {
-	SRP_MAD_METHOD_GET		= 0x01,
-	SRP_MAD_METHOD_SET		= 0x02,
-
-	SRP_SA_METHOD_REPORT		= 0x06,
-	SRP_SA_METHOD_GET_TABLE		= 0x12,
-	SRP_SA_METHOD_GET_RESP		= 0x81,
-	SRP_SA_METHOD_REPORT_RESP	= 0x86
 };
 
 enum {
@@ -113,57 +69,8 @@ enum {
 };
 
 enum {
-	SRP_MAD_HEADER_SIZE		= 24
-};
-
-enum {
 	SRP_REV10_IB_IO_CLASS	= 0xff00,
 	SRP_REV16A_IB_IO_CLASS	= 0x0100
-};
-
-enum {
-	SRP_TRAP_JOIN		= 0x40, /* 64 */
-	SRP_TRAP_LEFT		= 0x41, /* 65 */
-	SRP_TRAP_CHANGE_CAP 	= 0x90  /* 144 */
-};
-
-struct srp_dm_mad {
-	uint8_t		base_version;
-	uint8_t		mgmt_class;
-	uint8_t		class_version;
-	uint8_t		method;
-	__be16		status;
-	__be16		reserved1;
-	__be64		tid;
-	__be16		attr_id;
-	__be16		reserved2;
-	__be32		attr_mod;
-	uint8_t		reserved3[40];
-	uint8_t		data[192];
-};
-
-struct srp_dm_rmpp_sa_mad {
-	uint8_t		base_version;
-	uint8_t		mgmt_class;
-	uint8_t		class_version;
-	uint8_t		method;
-	__be16		status;
-	__be16		reserved1;
-	__be64		tid;
-	__be16		attr_id;
-	__be16		reserved2;
-	__be32		attr_mod;
-	uint8_t		rmpp_version;
-	uint8_t		rmpp_type;
-	uint8_t		rmpp_rtime_flags;
-	uint8_t		rmpp_status;
-	__be32		seg_num;
-	__be32		paylen_newwin;
-	__be64		sm_key __attribute__((packed));
-	__be16		attr_offset;
-	__be16		reserved3;
-	__be64		comp_mask;
-	uint8_t		data[200];
 };
 
 struct srp_sa_node_rec {
@@ -219,26 +126,6 @@ struct srp_sa_port_info_rec {
 	uint8_t		error_threshold;
 };
 
-struct srp_class_port_info {
-	uint8_t		base_version;
-	uint8_t		class_version;
-	__be16		cap_mask;
-	uint8_t		reserved1[3];
-	uint8_t		resp_time;
-	uint8_t		redir_gid[16];
-	__be32		redir_tc_sl_fl;
-	__be16		redir_lid;
-	__be16		redir_pkey;
-	__be32		redir_qpn;
-	__be32		redir_qkey;
-	uint8_t		trap_gid[16];
-	__be32		trap_tc_sl_fl;
-	__be16		trap_lid;
-	__be16		trap_pkey;
-	__be32		trap_hl_qpn;
-	__be32		trap_qkey;
-};
-
 struct srp_dm_iou_info {
 	__be16		change_id;
 	uint8_t		max_controllers;
@@ -276,10 +163,6 @@ struct srp_dm_svc_entries {
 		char		name[40];
 		__be64		id;
 	}		service[4];
-};
-
-enum {
-	MY_IB_QP1_WELL_KNOWN_Q_KEY = 0x80010000
 };
 
 enum {
@@ -347,7 +230,7 @@ struct ud_resources {
 	int   	                cq_size;
 	struct ibv_comp_channel *channel;
 	pthread_mutex_t		*mad_buffer_mutex;
-	ib_sa_mad_t		*mad_buffer;
+	struct umad_sa_packet	*mad_buffer;
 };
 
 struct umad_resources {
@@ -368,7 +251,7 @@ struct sync_resources {
 	struct {
 		uint16_t lid;
 		uint16_t pkey;
-		ib_gid_t gid;
+		union umad_gid gid;
 	} tasks[SIZE_OF_TASKS_LIST];
 	pthread_mutex_t mutex;
 	struct target_details *retry_tasks_head;
@@ -387,10 +270,10 @@ struct resources {
 	pthread_t timer_thread;
 };
 
-typedef struct {
+struct srp_ib_user_mad {
 	struct ib_user_mad hdr;
 	char filler[MAD_BLOCK_SIZE];
-} srp_ib_user_mad_t;
+};
 
 #include <valgrind/drd.h>
 
@@ -418,15 +301,16 @@ int create_trap_resources(struct ud_resources *ud_res);
 int register_to_traps(struct resources *res, int subscribe);
 uint16_t get_port_lid(struct ibv_context *ib_ctx, int port_num);
 int create_ah(struct ud_resources *ud_res);
-void push_gid_to_list(struct sync_resources *res, ib_gid_t *gid, uint16_t pkey);
+void push_gid_to_list(struct sync_resources *res, union umad_gid *gid,
+		      uint16_t pkey);
 void push_lid_to_list(struct sync_resources *res, uint16_t lid, uint16_t pkey);
 struct target_details *pop_from_retry_list(struct sync_resources *res);
 void push_to_retry_list(struct sync_resources *res,
 			struct target_details *target);
 int retry_list_is_empty(struct sync_resources *res);
 void clear_traps_list(struct sync_resources *res);
-int pop_from_list(struct sync_resources *res, uint16_t *lid, ib_gid_t *gid,
-		  uint16_t *pkey);
+int pop_from_list(struct sync_resources *res, uint16_t *lid,
+		  union umad_gid *gid, uint16_t *pkey);
 int sync_resources_init(struct sync_resources *res);
 void sync_resources_cleanup(struct sync_resources *res);
 int modify_qp_to_err(struct ibv_qp *qp);

@@ -28,6 +28,8 @@
  * SOFTWARE.
  */
 
+#define _GNU_SOURCE
+
 #include <config.h>
 
 #include <stdio.h>
@@ -57,6 +59,8 @@
 #include <rdma/ib_user_sa.h>
 #include <poll.h>
 #include <inttypes.h>
+#include <getopt.h>
+#include <systemd/sd-daemon.h>
 #include <ccan/list.h>
 #include <util/util.h>
 #include "acm_mad.h"
@@ -73,7 +77,7 @@
 
 struct acmc_subnet {
 	struct list_node       entry;
-	uint64_t               subnet_prefix;
+	__be64                 subnet_prefix;
 };
 
 struct acmc_prov {
@@ -265,7 +269,7 @@ void acm_format_name(int level, char *name, size_t name_size,
 		}
 		break;
 	case ACM_ADDRESS_LID:
-		snprintf(name, name_size, "LID(%u)", be16toh(*((uint16_t *) addr)));
+		snprintf(name, name_size, "LID(%u)", be16toh(*((__be16 *) addr)));
 		break;
 	default:
 		strcpy(name, "Unknown");
@@ -413,11 +417,11 @@ acm_addr_lookup(const struct acm_endpoint *endpoint, uint8_t *addr, uint8_t addr
 	return NULL;
 }
 
-uint64_t acm_path_comp_mask(struct ibv_path_record *path)
+__be64 acm_path_comp_mask(struct ibv_path_record *path)
 {
 	uint32_t fl_hop;
 	uint16_t qos_sl;
-	uint64_t comp_mask = 0;
+	__be64 comp_mask = 0;
 
 	acm_log(2, "\n");
 	if (path->service_id)
@@ -594,6 +598,62 @@ static int acm_listen(void)
 	}
 
 	acm_log(2, "listen active\n");
+	return 0;
+}
+
+/* Retrieve the listening socket from systemd. */
+static int acm_listen_systemd(void)
+{
+	int fd;
+
+	int rc = sd_listen_fds(1);
+	if (rc == -1) {
+		fprintf(stderr, "sd_listen_fds failed %d\n", rc);
+		return rc;
+	}
+
+	if (rc > 2) {
+		fprintf(stderr,
+			"sd_listen_fds returned %d fds, expected <= 2\n", rc);
+		return -1;
+	}
+
+	for (fd = SD_LISTEN_FDS_START; fd != SD_LISTEN_FDS_START + rc; fd++) {
+		if (sd_is_socket(fd, AF_NETLINK, SOCK_RAW, 0)) {
+			/* ListenNetlink for RDMA_NL_GROUP_LS multicast
+			 * messages from the kernel
+			 */
+			if (client_array[NL_CLIENT_INDEX].sock != -1) {
+				fprintf(stderr,
+					"sd_listen_fds returned more than one netlink socket\n");
+				return -1;
+			}
+			client_array[NL_CLIENT_INDEX].sock = fd;
+
+			/* systemd sets NONBLOCK on the netlink socket, while
+			 * we want blocking send to the kernel.
+			 */
+			if (set_fd_nonblock(fd, false)) {
+				fprintf(stderr,
+					"Unable to drop O_NOBLOCK on netlink socket");
+				return -1;
+			}
+		} else if (sd_is_socket(SD_LISTEN_FDS_START, AF_UNSPEC,
+					SOCK_STREAM, 1)) {
+			/* Socket for user space client communication */
+			if (listen_socket != -1) {
+				fprintf(stderr,
+					"sd_listen_fds returned more than one listening socket\n");
+				return -1;
+			}
+			listen_socket = fd;
+		} else {
+			fprintf(stderr,
+				"sd_listen_fds socket is not a SOCK_STREAM/SOCK_NETLINK listening socket\n");
+			return -1;
+		}
+	}
+
 	return 0;
 }
 
@@ -1667,7 +1727,7 @@ static int acm_init_nl(void)
 	return 0;
 }
 
-static void acm_server(void)
+static void acm_server(bool systemd)
 {
 	fd_set readfds;
 	int i, n, ret;
@@ -1675,15 +1735,33 @@ static void acm_server(void)
 
 	acm_log(0, "started\n");
 	acm_init_server();
-	ret = acm_listen();
-	if (ret) {
-		acm_log(0, "ERROR - server listen failed\n");
-		return;
+
+	client_array[NL_CLIENT_INDEX].sock = -1;
+	listen_socket = -1;
+	if (systemd) {
+		ret = acm_listen_systemd();
+		if (ret) {
+			acm_log(0, "ERROR - systemd server listen failed\n");
+			return;
+		}
 	}
 
-	ret = acm_init_nl();
-	if (ret)
-		acm_log(1, "Warn - Netlink init failed\n");
+	if (listen_socket == -1) {
+		ret = acm_listen();
+		if (ret) {
+			acm_log(0, "ERROR - server listen failed\n");
+			return;
+		}
+	}
+
+	if (client_array[NL_CLIENT_INDEX].sock == -1) {
+		ret = acm_init_nl();
+		if (ret)
+			acm_log(1, "Warn - Netlink init failed\n");
+	}
+
+	if (systemd)
+		sd_notify(0, "READY=1");
 
 	while (1) {
 		n = (int) listen_socket;
@@ -2149,6 +2227,7 @@ static void acm_port_up(struct acmc_port *port)
 {
 	struct ibv_port_attr attr;
 	uint16_t pkey;
+	__be16 pkey_be;
 	int i, ret;
 	struct acmc_prov_context *dev_ctx;
 	int index = -1;
@@ -2170,7 +2249,7 @@ static void acm_port_up(struct acmc_port *port)
 	acm_port_get_gid_tbl(port);
 	port->lid = attr.lid;
 	port->lid_mask = 0xffff - ((1 << attr.lmc) - 1);
-	port->sa_addr.lid = attr.sm_lid;
+	port->sa_addr.lid = htobe16(attr.sm_lid);
 	port->sa_addr.sl = attr.sm_sl;
 	port->state = IBV_PORT_ACTIVE;
 	acm_assign_provider(port);
@@ -2204,10 +2283,10 @@ static void acm_port_up(struct acmc_port *port)
 	 */
 	for (i = 0; i < attr.pkey_tbl_len; i++) {
 		ret = ibv_query_pkey(port->dev->device.verbs,
-				     port->port.port_num, i, &pkey);
+				     port->port.port_num, i, &pkey_be);
 		if (ret)
 			continue;
-		pkey = be16toh(pkey);
+		pkey = be16toh(pkey_be);
 		if (i == 0)
 			first_pkey = pkey;
 		if (pkey == 0xffff) {
@@ -2223,10 +2302,10 @@ static void acm_port_up(struct acmc_port *port)
 
 	for (i = 0; i < attr.pkey_tbl_len; i++) {
 		ret = ibv_query_pkey(port->dev->device.verbs,
-				     port->port.port_num, i, &pkey);
+				     port->port.port_num, i, &pkey_be);
 		if (ret)
 			continue;
-		pkey = be16toh(pkey);
+		pkey = be16toh(pkey_be);
 		if (!(pkey & 0x7fff))
 			continue;
 
@@ -2497,8 +2576,6 @@ static void acm_load_prov_config(void)
 		prefix = strtoull(p, NULL, 0);
 		acm_log(2, "provider %s subnet_prefix 0x%" PRIx64 "\n",
 			prov_name, prefix);
-		/* Convert it into network byte order */
-		prefix = htobe64(prefix);
 
 		list_for_each(&provider_list, prov, entry) {
 			if (!strcasecmp(prov->prov->name, prov_name)) {
@@ -2507,7 +2584,7 @@ static void acm_load_prov_config(void)
 					acm_log(0, "Error: out of memory\n");
 					return;
 				}
-				subnet->subnet_prefix = prefix;
+				subnet->subnet_prefix = htobe64(prefix);
 				list_add_after(&provider_list, &prov->entry,
 						&subnet->entry);
 			}
@@ -2646,7 +2723,7 @@ static int acmc_init_sa_fds(void)
 		for (p = 0; p < dev->port_cnt; p++) {
 			sa.fds[i].fd = umad_get_fd(dev->port[p].mad_portid);
 			sa.fds[i].events = POLLIN;
-			ret = fcntl(sa.fds[i].fd, F_SETFL, O_NONBLOCK);
+			ret = set_fd_nonblock(sa.fds[i].fd, true);
 			if (ret)
 				acm_log(0, "WARNING - umad fd is blocking\n");
 
@@ -2701,7 +2778,7 @@ int acm_send_sa_mad(struct acm_sa_mad *mad)
 	port = req->ep->port;
 	mad->umad.addr.qpn = port->sa_addr.qpn;
 	mad->umad.addr.qkey = port->sa_addr.qkey;
-	mad->umad.addr.lid = htobe16(port->sa_addr.lid);
+	mad->umad.addr.lid = port->sa_addr.lid;
 	mad->umad.addr.sl = port->sa_addr.sl;
 	mad->umad.addr.pkey_index = req->ep->port->sa_pkey_index;
 
@@ -2934,29 +3011,6 @@ static int acm_open_lock_file(void)
 	return 0;
 }
 
-static void daemonize(void)
-{
-	pid_t pid, sid;
-
-	pid = fork();
-	if (pid)
-		exit(pid < 0);
-
-	sid = setsid();
-	if (sid < 0)
-		exit(1);
-
-	if (chdir("/"))
-		exit(1);
-
-	if(!freopen("/dev/null", "r", stdin))
-		exit(1);
-	if(!freopen("/dev/null", "w", stdout))
-		exit(1);
-	if(!freopen("/dev/null", "w", stderr))
-		exit(1);
-}
-
 static void show_usage(char *program)
 {
 	printf("usage: %s\n", program);
@@ -2970,15 +3024,22 @@ static void show_usage(char *program)
 
 int main(int argc, char **argv)
 {
-	int i, op, daemon = 1;
+	int i, op, as_daemon = 1;
+	bool systemd = false;
 
-	while ((op = getopt(argc, argv, "DPA:O:")) != -1) {
+	static const struct option long_opts[] = {
+		{"systemd", 0, NULL, 's'},
+		{}
+	};
+
+	while ((op = getopt_long(argc, argv, "DPA:O:", long_opts, NULL)) !=
+	       -1) {
 		switch (op) {
 		case 'D':
 			/* option no longer required */
 			break;
 		case 'P':
-			daemon = 0;
+			as_daemon = 0;
 			break;
 		case 'A':
 			addr_file = optarg;
@@ -2986,14 +3047,19 @@ int main(int argc, char **argv)
 		case 'O':
 			opts_file = optarg;
 			break;
+		case 's':
+			systemd = true;
+			break;
 		default:
 			show_usage(argv[0]);
 			exit(1);
 		}
 	}
 
-	if (daemon)
-		daemonize();
+	if (as_daemon && !systemd) {
+		if (daemon(0, 0))
+			return EXIT_FAILURE;
+	}
 
 	acm_set_options();
 	if (acm_open_lock_file())
@@ -3033,7 +3099,7 @@ int main(int argc, char **argv)
 	}
 	acm_activate_devices();
 	acm_log(1, "starting server\n");
-	acm_server();
+	acm_server(systemd);
 
 	acm_log(0, "shutting down\n");
 	if (client_array[NL_CLIENT_INDEX].sock != -1)

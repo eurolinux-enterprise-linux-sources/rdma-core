@@ -93,7 +93,7 @@
 #elif defined(__sparc_v9__)
 #define udma_to_device_barrier() asm volatile("membar #StoreStore" ::: "memory")
 #elif defined(__aarch64__)
-#define wmb() asm volatile("dsb st" ::: "memory");
+#define udma_to_device_barrier() asm volatile("dsb st" ::: "memory");
 #elif defined(__sparc__) || defined(__s390x__)
 #define udma_to_device_barrier() asm volatile("" ::: "memory")
 #else
@@ -192,6 +192,7 @@
 #define mmio_flush_writes() asm volatile("dsb st" ::: "memory");
 #elif defined(__sparc__) || defined(__s390x__)
 #define mmio_flush_writes() asm volatile("" ::: "memory")
+#else
 #error No architecture specific memory barrier defines found!
 #endif
 
