@@ -87,6 +87,9 @@ int mlx4_query_device_ex(struct ibv_context *context,
 	if (err)
 		return err;
 
+	attr->rss_caps.rx_hash_fields_mask = resp.rss_caps.rx_hash_fields_mask;
+	attr->rss_caps.rx_hash_function = resp.rss_caps.rx_hash_function;
+
 	if (resp.comp_mask & MLX4_QUERY_DEV_RESP_MASK_CORE_CLOCK_OFFSET) {
 		mctx->core_clock.offset = resp.hca_core_clock_offset;
 		mctx->core_clock.offset_valid = 1;
@@ -131,6 +134,9 @@ int mlx4_query_rt_values(struct ibv_context *context,
 {
 	uint32_t comp_mask = 0;
 	int err = 0;
+
+	if (!check_comp_mask(values->comp_mask, IBV_VALUES_MASK_RAW_CLOCK))
+		return EINVAL;
 
 	if (values->comp_mask & IBV_VALUES_MASK_RAW_CLOCK) {
 		uint64_t cycles;
@@ -229,7 +235,7 @@ struct ibv_xrcd *mlx4_open_xrcd(struct ibv_context *context,
 				struct ibv_xrcd_init_attr *attr)
 {
 	struct ibv_open_xrcd cmd;
-	struct ibv_open_xrcd_resp resp;
+	struct ib_uverbs_open_xrcd_resp resp;
 	struct verbs_xrcd *xrcd;
 	int ret;
 
@@ -267,7 +273,7 @@ struct ibv_mr *mlx4_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
 {
 	struct ibv_mr *mr;
 	struct ibv_reg_mr cmd;
-	struct ibv_reg_mr_resp resp;
+	struct ib_uverbs_reg_mr_resp resp;
 	int ret;
 
 	mr = malloc(sizeof *mr);
@@ -291,7 +297,7 @@ int mlx4_rereg_mr(struct ibv_mr *mr,
 		  size_t length, int access)
 {
 	struct ibv_rereg_mr cmd;
-	struct ibv_rereg_mr_resp resp;
+	struct ib_uverbs_rereg_mr_resp resp;
 
 	if (flags & IBV_REREG_MR_KEEP_VALID)
 		return ENOTSUP;
@@ -319,7 +325,7 @@ struct ibv_mw *mlx4_alloc_mw(struct ibv_pd *pd, enum ibv_mw_type type)
 {
 	struct ibv_mw *mw;
 	struct ibv_alloc_mw cmd;
-	struct ibv_alloc_mw_resp resp;
+	struct ib_uverbs_alloc_mw_resp resp;
 	int ret;
 
 	mw = calloc(1, sizeof(*mw));
@@ -570,6 +576,11 @@ struct ibv_cq_ex *mlx4_create_cq_ex(struct ibv_context *context,
 						.comp_mask = cq_attr->comp_mask,
 						.flags = cq_attr->flags};
 
+	if (!check_comp_mask(cq_attr_c.comp_mask, IBV_CQ_INIT_ATTR_MASK_RESERVED - 1)) {
+		errno = EINVAL;
+		return NULL;
+	}
+
 	return create_cq(context, &cq_attr_c, MLX4_CQ_FLAGS_EXTENDED);
 }
 
@@ -577,7 +588,7 @@ int mlx4_resize_cq(struct ibv_cq *ibcq, int cqe)
 {
 	struct mlx4_cq *cq = to_mcq(ibcq);
 	struct mlx4_resize_cq cmd;
-	struct ibv_resize_cq_resp resp;
+	struct ib_uverbs_resize_cq_resp resp;
 	struct mlx4_buf buf;
 	int old_cqe, outst_cqe, ret;
 
@@ -852,7 +863,7 @@ static struct ibv_qp *create_qp_ex(struct ibv_context *context,
 {
 	struct mlx4_context *ctx = to_mctx(context);
 	struct mlx4_create_qp     cmd = {};
-	struct ibv_create_qp_resp resp = {};
+	struct ib_uverbs_create_qp_resp resp = {};
 	struct mlx4_qp		 *qp;
 	int			  ret;
 
@@ -919,8 +930,8 @@ static struct ibv_qp *create_qp_ex(struct ibv_context *context,
 		goto err_free;
 
 	if (mlx4qp_attr) {
-		if (mlx4qp_attr->comp_mask &
-		    ~(MLX4DV_QP_INIT_ATTR_MASK_RESERVED - 1)) {
+		if (!check_comp_mask(mlx4qp_attr->comp_mask,
+		    MLX4DV_QP_INIT_ATTR_MASK_RESERVED - 1)) {
 			errno = EINVAL;
 			goto err_free;
 		}
@@ -1031,7 +1042,7 @@ struct ibv_qp *mlx4_create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *attr)
 struct ibv_qp *mlx4_open_qp(struct ibv_context *context, struct ibv_qp_open_attr *attr)
 {
 	struct ibv_open_qp cmd;
-	struct ibv_create_qp_resp resp;
+	struct ib_uverbs_create_qp_resp resp;
 	struct mlx4_qp *qp;
 	int ret;
 
@@ -1387,7 +1398,7 @@ struct ibv_wq *mlx4_create_wq(struct ibv_context *context,
 {
 	struct mlx4_context		*ctx = to_mctx(context);
 	struct mlx4_create_wq		cmd = {};
-	struct ibv_create_wq_resp	resp = {};
+	struct ib_uverbs_ex_create_wq_resp	resp = {};
 	struct mlx4_qp			*qp;
 	int				ret;
 
@@ -1519,6 +1530,36 @@ int mlx4_modify_wq(struct ibv_wq *ibwq, struct ibv_wq_attr *attr)
 	return ret;
 }
 
+struct ibv_flow *mlx4_create_flow(struct ibv_qp *qp, struct ibv_flow_attr *flow_attr)
+{
+	struct ibv_flow *flow_id;
+	int ret;
+
+	flow_id = calloc(1, sizeof *flow_id);
+	if (!flow_id)
+		return NULL;
+
+	ret = ibv_cmd_create_flow(qp, flow_id, flow_attr);
+	if (!ret)
+		return flow_id;
+
+	free(flow_id);
+	return NULL;
+}
+
+int mlx4_destroy_flow(struct ibv_flow *flow_id)
+{
+	int ret;
+
+	ret = ibv_cmd_destroy_flow(flow_id);
+
+	if (ret && !cleanup_on_fatal(ret))
+		return ret;
+
+	free(flow_id);
+	return 0;
+}
+
 int mlx4_destroy_wq(struct ibv_wq *ibwq)
 {
 	struct mlx4_context *mcontext = to_mctx(ibwq->context);
@@ -1559,7 +1600,7 @@ struct ibv_rwq_ind_table *mlx4_create_rwq_ind_table(struct ibv_context *context,
 						    struct ibv_rwq_ind_table_init_attr *init_attr)
 {
 	struct ibv_create_rwq_ind_table *cmd;
-	struct ibv_create_rwq_ind_table_resp resp = {};
+	struct ib_uverbs_ex_create_rwq_ind_table_resp resp = {};
 	struct ibv_rwq_ind_table *ind_table;
 	uint32_t required_tbl_size;
 	unsigned int num_tbl_entries;
@@ -1608,4 +1649,11 @@ int mlx4_destroy_rwq_ind_table(struct ibv_rwq_ind_table *rwq_ind_table)
 
 	free(rwq_ind_table);
 	return 0;
+}
+
+int mlx4_modify_cq(struct ibv_cq *cq, struct ibv_modify_cq_attr *attr)
+{
+	struct ibv_modify_cq cmd = {};
+
+	return ibv_cmd_modify_cq(cq, attr, &cmd, sizeof(cmd));
 }

@@ -50,6 +50,7 @@
 #include <byteswap.h>
 #include <util/compiler.h>
 #include <util/util.h>
+#include <ccan/container_of.h>
 
 #include <rdma/rdma_cma.h>
 #include <rdma/rdma_verbs.h>
@@ -408,14 +409,14 @@ struct ds_udp_header {
 static void write_all(int fd, const void *msg, size_t len)
 {
 	// FIXME: if fd is a socket this really needs to handle EINTR and other conditions.
-	ssize_t rc = write(fd, msg, len);
+	ssize_t __attribute__((unused)) rc = write(fd, msg, len);
 	assert(rc == len);
 }
 
 static void read_all(int fd, void *msg, size_t len)
 {
 	// FIXME: if fd is a socket this really needs to handle EINTR and other conditions.
-	ssize_t rc = read(fd, msg, len);
+	ssize_t __attribute__((unused)) rc = read(fd, msg, len);
 	assert(rc == len);
 }
 

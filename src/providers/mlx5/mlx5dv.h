@@ -35,6 +35,7 @@
 
 #include <stdio.h>
 #include <linux/types.h> /* For the __be64 type */
+#include <sys/types.h>
 #include <endian.h>
 #if defined(__SSE3__)
 #include <limits.h>
@@ -43,6 +44,11 @@
 #endif /* defined(__SSE3__) */
 
 #include <infiniband/verbs.h>
+#include <infiniband/tm_types.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* Always inline the functions */
 #ifdef __GNUC__
@@ -58,12 +64,35 @@ enum {
 
 enum mlx5dv_context_comp_mask {
 	MLX5DV_CONTEXT_MASK_CQE_COMPRESION	= 1 << 0,
-	MLX5DV_CONTEXT_MASK_RESERVED		= 1 << 1,
+	MLX5DV_CONTEXT_MASK_SWP			= 1 << 1,
+	MLX5DV_CONTEXT_MASK_STRIDING_RQ		= 1 << 2,
+	MLX5DV_CONTEXT_MASK_TUNNEL_OFFLOADS	= 1 << 3,
+	MLX5DV_CONTEXT_MASK_DYN_BFREGS		= 1 << 4,
+	MLX5DV_CONTEXT_MASK_CLOCK_INFO_UPDATE	= 1 << 5,
 };
 
 struct mlx5dv_cqe_comp_caps {
 	uint32_t max_num;
 	uint32_t supported_format; /* enum mlx5dv_cqe_comp_res_format */
+};
+
+struct mlx5dv_sw_parsing_caps {
+	uint32_t sw_parsing_offloads; /* Use enum mlx5dv_sw_parsing_offloads */
+	uint32_t supported_qpts;
+};
+
+struct mlx5dv_striding_rq_caps {
+	uint32_t min_single_stride_log_num_of_bytes;
+	uint32_t max_single_stride_log_num_of_bytes;
+	uint32_t min_single_wqe_log_num_of_strides;
+	uint32_t max_single_wqe_log_num_of_strides;
+	uint32_t supported_qpts;
+};
+
+enum mlx5dv_tunnel_offloads {
+	MLX5DV_RAW_PACKET_CAP_TUNNELED_OFFLOAD_VXLAN	= 1 << 0,
+	MLX5DV_RAW_PACKET_CAP_TUNNELED_OFFLOAD_GRE	= 1 << 1,
+	MLX5DV_RAW_PACKET_CAP_TUNNELED_OFFLOAD_GENEVE	= 1 << 2,
 };
 
 /*
@@ -74,6 +103,11 @@ struct mlx5dv_context {
 	uint64_t	flags;
 	uint64_t	comp_mask;
 	struct mlx5dv_cqe_comp_caps	cqe_comp_caps;
+	struct mlx5dv_sw_parsing_caps sw_parsing_caps;
+	struct mlx5dv_striding_rq_caps striding_rq_caps;
+	uint32_t	tunnel_offloads_caps;
+	uint32_t	max_dynamic_bfregs;
+	uint64_t	max_clock_info_update_nsec;
 };
 
 enum mlx5dv_context_flags {
@@ -84,21 +118,59 @@ enum mlx5dv_context_flags {
 	MLX5DV_CONTEXT_FLAGS_OBSOLETE	= (1 << 1), /* Obsoleted, don't use */
 	MLX5DV_CONTEXT_FLAGS_MPW_ALLOWED = (1 << 2),
 	MLX5DV_CONTEXT_FLAGS_ENHANCED_MPW = (1 << 3),
+	MLX5DV_CONTEXT_FLAGS_CQE_128B_COMP = (1 << 4), /* Support CQE 128B compression */
+	MLX5DV_CONTEXT_FLAGS_CQE_128B_PAD = (1 << 5), /* Support CQE 128B padding */
 };
 
 enum mlx5dv_cq_init_attr_mask {
 	MLX5DV_CQ_INIT_ATTR_MASK_COMPRESSED_CQE	= 1 << 0,
-	MLX5DV_CQ_INIT_ATTR_MASK_RESERVED	= 1 << 1,
+	MLX5DV_CQ_INIT_ATTR_MASK_FLAGS		= 1 << 1,
+	MLX5DV_CQ_INIT_ATTR_MASK_RESERVED	= 1 << 2,
+};
+
+enum mlx5dv_cq_init_attr_flags {
+	MLX5DV_CQ_INIT_ATTR_FLAGS_CQE_PAD	= 1 << 0,
+	MLX5DV_CQ_INIT_ATTR_FLAGS_RESERVED	= 1 << 1,
 };
 
 struct mlx5dv_cq_init_attr {
 	uint64_t comp_mask; /* Use enum mlx5dv_cq_init_attr_mask */
 	uint8_t cqe_comp_res_format; /* Use enum mlx5dv_cqe_comp_res_format */
+	uint32_t flags; /* Use enum mlx5dv_cq_init_attr_flags */
 };
 
 struct ibv_cq_ex *mlx5dv_create_cq(struct ibv_context *context,
 				   struct ibv_cq_init_attr_ex *cq_attr,
 				   struct mlx5dv_cq_init_attr *mlx5_cq_attr);
+
+enum mlx5dv_qp_create_flags {
+	MLX5DV_QP_CREATE_TUNNEL_OFFLOADS = 1 << 0,
+};
+
+enum mlx5dv_qp_init_attr_mask {
+	MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS	= 1 << 0,
+	MLX5DV_QP_INIT_ATTR_MASK_DC			= 1 << 1,
+};
+
+enum mlx5dv_dc_type {
+	MLX5DV_DCTYPE_DCT     = 1,
+	MLX5DV_DCTYPE_DCI,
+};
+
+struct mlx5dv_dc_init_attr {
+	enum mlx5dv_dc_type	dc_type;
+	uint64_t dct_access_key;
+};
+
+struct mlx5dv_qp_init_attr {
+	uint64_t comp_mask;	/* Use enum mlx5dv_qp_init_attr_mask */
+	uint32_t create_flags;	/* Use enum mlx5dv_qp_create_flags */
+	struct mlx5dv_dc_init_attr  dc_init_attr;
+};
+
+struct ibv_qp *mlx5dv_create_qp(struct ibv_context *context,
+				struct ibv_qp_init_attr_ex *qp_attr,
+				struct mlx5dv_qp_init_attr *mlx5_qp_attr);
 /*
  * Most device capabilities are exported by ibv_query_device(...),
  * but there is HW device-specific information which is important
@@ -186,6 +258,43 @@ enum mlx5dv_obj_type {
 	MLX5DV_OBJ_RWQ	= 1 << 3,
 };
 
+enum mlx5dv_wq_init_attr_mask {
+	MLX5DV_WQ_INIT_ATTR_MASK_STRIDING_RQ	= 1 << 0,
+};
+
+struct mlx5dv_striding_rq_init_attr {
+	uint32_t	single_stride_log_num_of_bytes;
+	uint32_t	single_wqe_log_num_of_strides;
+	uint8_t		two_byte_shift_en;
+};
+
+struct mlx5dv_wq_init_attr {
+	uint64_t				comp_mask; /* Use enum mlx5dv_wq_init_attr_mask */
+	struct mlx5dv_striding_rq_init_attr	striding_rq_attrs;
+};
+
+/*
+ * This function creates a work queue object with extra properties
+ * defined by mlx5dv_wq_init_attr struct.
+ *
+ * For each bit in the comp_mask, a field in mlx5dv_wq_init_attr
+ * should follow.
+ *
+ * MLX5DV_WQ_INIT_ATTR_MASK_STRIDING_RQ: Create a work queue with
+ * striding RQ capabilities.
+ * - single_stride_log_num_of_bytes represents the size of each stride in the
+ *   WQE and its value should be between min_single_stride_log_num_of_bytes
+ *   and max_single_stride_log_num_of_bytes that are reported in
+ *   mlx5dv_query_device.
+ * - single_wqe_log_num_of_strides represents the number of strides in each WQE.
+ *   Its value should be between min_single_wqe_log_num_of_strides and
+ *   max_single_wqe_log_num_of_strides that are reported in mlx5dv_query_device.
+ * - two_byte_shift_en: When enabled, hardware pads 2 bytes of zeroes
+ *   before writing the message to memory (e.g. for IP alignment)
+ */
+struct ibv_wq *mlx5dv_create_wq(struct ibv_context *context,
+				struct ibv_wq_init_attr *wq_init_attr,
+				struct mlx5dv_wq_init_attr *mlx5_wq_attr);
 /*
  * This function will initialize mlx5dv_xxx structs based on supplied type.
  * The information for initialization is taken from ibv_xx structs supplied
@@ -217,6 +326,7 @@ enum {
 	MLX5_OPCODE_LOCAL_INVAL		= 0x1b,
 	MLX5_OPCODE_CONFIG_CMD		= 0x1f,
 	MLX5_OPCODE_UMR			= 0x25,
+	MLX5_OPCODE_TAG_MATCHING	= 0x28
 };
 
 /*
@@ -264,6 +374,7 @@ enum {
 	MLX5_CQE_RESP_SEND_IMM	= 3,
 	MLX5_CQE_RESP_SEND_INV	= 4,
 	MLX5_CQE_RESIZE_CQ	= 5,
+	MLX5_CQE_NO_PACKET	= 6,
 	MLX5_CQE_REQ_ERR	= 13,
 	MLX5_CQE_RESP_ERR	= 14,
 	MLX5_CQE_INVALID	= 15,
@@ -290,18 +401,35 @@ struct mlx5_err_cqe {
 	uint8_t		op_own;
 };
 
+struct mlx5_tm_cqe {
+	__be32		success;
+	__be16		hw_phase_cnt;
+	uint8_t		rsvd0[12];
+};
+
 struct mlx5_cqe64 {
-	uint8_t		rsvd0[17];
-	uint8_t		ml_path;
-	uint8_t		rsvd20[4];
-	__be16		slid;
-	__be32		flags_rqpn;
-	uint8_t		hds_ip_ext;
-	uint8_t		l4_hdr_type_etc;
-	__be16		vlan_info;
+	union {
+		struct {
+			uint8_t		rsvd0[2];
+			__be16		wqe_id;
+			uint8_t		rsvd4[13];
+			uint8_t		ml_path;
+			uint8_t		rsvd20[4];
+			__be16		slid;
+			__be32		flags_rqpn;
+			uint8_t		hds_ip_ext;
+			uint8_t		l4_hdr_type_etc;
+			__be16		vlan_info;
+		};
+		struct mlx5_tm_cqe tm_cqe;
+		/* TMH is scattered to CQE upon match */
+		struct ibv_tmh tmh;
+	};
 	__be32		srqn_uidx;
 	__be32		imm_inval_pkey;
-	uint8_t		rsvd40[4];
+	uint8_t		app;
+	uint8_t		app_op;
+	__be16		app_info;
 	__be32		byte_cnt;
 	__be64		timestamp;
 	__be32		sop_drop_qpn;
@@ -310,10 +438,20 @@ struct mlx5_cqe64 {
 	uint8_t		op_own;
 };
 
+enum {
+	MLX5_TMC_SUCCESS	= 0x80000000U,
+};
+
 enum mlx5dv_cqe_comp_res_format {
 	MLX5DV_CQE_RES_FORMAT_HASH		= 1 << 0,
 	MLX5DV_CQE_RES_FORMAT_CSUM		= 1 << 1,
 	MLX5DV_CQE_RES_FORMAT_RESERVED		= 1 << 2,
+};
+
+enum mlx5dv_sw_parsing_offloads {
+	MLX5DV_SW_PARSING		= 1 << 0,
+	MLX5DV_SW_PARSING_CSUM		= 1 << 1,
+	MLX5DV_SW_PARSING_LSO		= 1 << 2,
 };
 
 static MLX5DV_ALWAYS_INLINE
@@ -401,6 +539,11 @@ struct mlx5_wqe_ctrl_seg {
 	__be32		imm;
 };
 
+struct mlx5_mprq_wqe {
+	struct mlx5_wqe_srq_next_seg	nseg;
+	struct mlx5_wqe_data_seg	dseg;
+};
+
 struct mlx5_wqe_av {
 	union {
 		struct {
@@ -449,6 +592,17 @@ struct mlx5_wqe_eth_seg {
 	__be16		inline_hdr_sz;
 	uint8_t		inline_hdr_start[2];
 	uint8_t		inline_hdr[16];
+};
+
+struct mlx5_wqe_tm_seg {
+	uint8_t		opcode;
+	uint8_t		flags;
+	__be16		index;
+	uint8_t		rsvd0[2];
+	__be16		sw_cnt;
+	uint8_t		rsvd1[8];
+	__be64		append_tag;
+	__be64		append_mask;
 };
 
 /*
@@ -632,6 +786,11 @@ enum mlx5dv_set_ctx_attr_type {
 	MLX5DV_CTX_ATTR_BUF_ALLOCATORS = 1,
 };
 
+enum {
+	MLX5_MMAP_GET_REGULAR_PAGES_CMD	= 0,
+	MLX5_MMAP_GET_NC_PAGES_CMD	= 3,
+};
+
 struct mlx5dv_ctx_allocators {
 	void *(*alloc)(size_t size, void *priv_data);
 	void (*free)(void *ptr, void *priv_data);
@@ -646,5 +805,71 @@ struct mlx5dv_ctx_allocators {
  */
 int mlx5dv_set_context_attr(struct ibv_context *context,
 		enum mlx5dv_set_ctx_attr_type type, void *attr);
+
+struct mlx5dv_clock_info {
+	uint64_t nsec;
+	uint64_t last_cycles;
+	uint64_t frac;
+	uint32_t mult;
+	uint32_t shift;
+	uint64_t mask;
+};
+
+/*
+ * Get mlx5 core clock info
+ *
+ * Output:
+ *      clock_info  - clock info to be filled
+ * Input:
+ *      context     - device context
+ *
+ * Return: 0 on success, or the value of errno on failure
+ */
+int mlx5dv_get_clock_info(struct ibv_context *context,
+			  struct mlx5dv_clock_info *clock_info);
+
+/*
+ * Translate device timestamp to nano-sec
+ *
+ * Input:
+ *      clock_info  - clock info to be filled
+ *      device_timestamp   - timestamp to translate
+ *
+ * Return: nano-sec
+ */
+static inline uint64_t mlx5dv_ts_to_ns(struct mlx5dv_clock_info *clock_info,
+				       uint64_t device_timestamp)
+{
+	uint64_t delta, nsec;
+
+	/*
+	 * device_timestamp & cycles are the free running 'mask' bit counters
+	 * from the hardware hca_core_clock clock.
+	 */
+	delta = (device_timestamp - clock_info->last_cycles) & clock_info->mask;
+	nsec  = clock_info->nsec;
+
+	/*
+	 * Guess if the device_timestamp is more recent than
+	 * clock_info->last_cycles, if not (too far in the future) treat
+	 * it as old time stamp. This will break every max_clock_info_update_nsec.
+	 */
+
+	if (delta > clock_info->mask / 2) {
+		delta = (clock_info->last_cycles - device_timestamp) &
+				clock_info->mask;
+		nsec -= ((delta * clock_info->mult) - clock_info->frac) >>
+				clock_info->shift;
+	} else {
+		nsec += ((delta * clock_info->mult) + clock_info->frac) >>
+				clock_info->shift;
+	}
+
+	return nsec;
+}
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _MLX5DV_H_ */

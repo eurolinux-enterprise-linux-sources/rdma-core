@@ -99,7 +99,7 @@ struct mlx4_device {
 struct mlx4_db_page;
 
 struct mlx4_context {
-	struct ibv_context		ibv_ctx;
+	struct verbs_context		ibv_ctx;
 
 	void			       *uar;
 
@@ -247,21 +247,20 @@ static inline unsigned long align(unsigned long val, unsigned long align)
 }
 int align_queue_size(int req);
 
-#define to_mxxx(xxx, type)						\
-	((struct mlx4_##type *)					\
-	 ((void *) ib##xxx - offsetof(struct mlx4_##type, ibv_##xxx)))
+#define to_mxxx(xxx, type)                                                     \
+	container_of(ib##xxx, struct mlx4_##type, ibv_##xxx)
 
 static inline struct mlx4_device *to_mdev(struct ibv_device *ibdev)
 {
 	/* ibv_device is first field of verbs_device
 	 * see try_driver() in libibverbs.
 	 */
-	return container_of(ibdev, struct mlx4_device, verbs_dev);
+	return container_of(ibdev, struct mlx4_device, verbs_dev.device);
 }
 
 static inline struct mlx4_context *to_mctx(struct ibv_context *ibctx)
 {
-	return to_mxxx(ctx, context);
+	return container_of(ibctx, struct mlx4_context, ibv_ctx.context);
 }
 
 static inline struct mlx4_pd *to_mpd(struct ibv_pd *ibpd)
@@ -271,19 +270,17 @@ static inline struct mlx4_pd *to_mpd(struct ibv_pd *ibpd)
 
 static inline struct mlx4_cq *to_mcq(struct ibv_cq *ibcq)
 {
-	return to_mxxx(cq, cq);
+	return container_of((struct ibv_cq_ex *)ibcq, struct mlx4_cq, ibv_cq);
 }
 
 static inline struct mlx4_srq *to_msrq(struct ibv_srq *ibsrq)
 {
-	return container_of(container_of(ibsrq, struct verbs_srq, srq),
-			    struct mlx4_srq, verbs_srq);
+	return container_of(ibsrq, struct mlx4_srq, verbs_srq.srq);
 }
 
 static inline struct mlx4_qp *to_mqp(struct ibv_qp *ibqp)
 {
-	return container_of(container_of(ibqp, struct verbs_qp, qp),
-			    struct mlx4_qp, verbs_qp);
+	return container_of(ibqp, struct mlx4_qp, verbs_qp.qp);
 }
 
 static inline struct mlx4_qp *wq_to_mqp(struct ibv_wq *ibwq)
@@ -350,6 +347,7 @@ void mlx4_cq_fill_pfns(struct mlx4_cq *cq, const struct ibv_cq_init_attr_ex *cq_
 int mlx4_alloc_cq_buf(struct mlx4_device *dev, struct mlx4_buf *buf, int nent,
 		      int entry_size);
 int mlx4_resize_cq(struct ibv_cq *cq, int cqe);
+int mlx4_modify_cq(struct ibv_cq *cq, struct ibv_modify_cq_attr *attr);
 int mlx4_destroy_cq(struct ibv_cq *cq);
 int mlx4_poll_cq(struct ibv_cq *cq, int ne, struct ibv_wc *wc);
 int mlx4_arm_cq(struct ibv_cq *cq, int solicited);
@@ -424,5 +422,7 @@ struct ibv_rwq_ind_table *mlx4_create_rwq_ind_table(struct ibv_context *context,
 int mlx4_destroy_rwq_ind_table(struct ibv_rwq_ind_table *rwq_ind_table);
 int mlx4_post_wq_recv(struct ibv_wq *ibwq, struct ibv_recv_wr *wr,
 		      struct ibv_recv_wr **bad_wr);
+struct ibv_flow *mlx4_create_flow(struct ibv_qp *qp, struct ibv_flow_attr *flow_attr);
+int mlx4_destroy_flow(struct ibv_flow *flow_id);
 
 #endif /* MLX4_H */

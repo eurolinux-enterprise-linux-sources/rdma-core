@@ -1818,32 +1818,44 @@ static void acm_server(bool systemd)
 enum ibv_rate acm_get_rate(uint8_t width, uint8_t speed)
 {
 	switch (width) {
-	case 1:
+	case 1: /* 1x */
 		switch (speed) {
 		case 1: return IBV_RATE_2_5_GBPS;
 		case 2: return IBV_RATE_5_GBPS;
-		case 4: return IBV_RATE_10_GBPS;
+		case 4: /* fall through */
+		case 8: return IBV_RATE_10_GBPS;
+		case 16: return IBV_RATE_14_GBPS;
+		case 32: return IBV_RATE_25_GBPS;
 		default: return IBV_RATE_MAX;
 		}
-	case 2:
+	case 2: /* 4x */
 		switch (speed) {
 		case 1: return IBV_RATE_10_GBPS;
 		case 2: return IBV_RATE_20_GBPS;
-		case 4: return IBV_RATE_40_GBPS;
+		case 4: /* fall through */
+		case 8: return IBV_RATE_40_GBPS;
+		case 16: return IBV_RATE_56_GBPS;
+		case 32: return IBV_RATE_100_GBPS;
 		default: return IBV_RATE_MAX;
 		}
-	case 4:
+	case 4: /* 8x */
 		switch (speed) {
 		case 1: return IBV_RATE_20_GBPS;
 		case 2: return IBV_RATE_40_GBPS;
-		case 4: return IBV_RATE_80_GBPS;
+		case 4: /* fall through */
+		case 8: return IBV_RATE_80_GBPS;
+		case 16: return IBV_RATE_112_GBPS;
+		case 32: return IBV_RATE_200_GBPS;
 		default: return IBV_RATE_MAX;
 		}
-	case 8:
+	case 8: /* 12x */
 		switch (speed) {
 		case 1: return IBV_RATE_30_GBPS;
 		case 2: return IBV_RATE_60_GBPS;
-		case 4: return IBV_RATE_120_GBPS;
+		case 4: /* fall through */
+		case 8: return IBV_RATE_120_GBPS;
+		case 16: return IBV_RATE_168_GBPS;
+		case 32: return IBV_RATE_300_GBPS;
 		default: return IBV_RATE_MAX;
 		}
 	default:
@@ -1876,6 +1888,14 @@ enum ibv_rate acm_convert_rate(int rate)
 	case 60:  return IBV_RATE_60_GBPS;
 	case 80:  return IBV_RATE_80_GBPS;
 	case 120: return IBV_RATE_120_GBPS;
+	case 14:  return IBV_RATE_14_GBPS;
+	case 56:  return IBV_RATE_56_GBPS;
+	case 112: return IBV_RATE_112_GBPS;
+	case 168: return IBV_RATE_168_GBPS;
+	case 25:  return IBV_RATE_25_GBPS;
+	case 100: return IBV_RATE_100_GBPS;
+	case 200: return IBV_RATE_200_GBPS;
+	case 300: return IBV_RATE_300_GBPS;
 	default:  return IBV_RATE_10_GBPS;
 	}
 }
@@ -2017,7 +2037,7 @@ static int acm_assign_ep_names(struct acmc_ep *ep)
 		if (s[0] == '#')
 			continue;
 
-		if (sscanf(s, "%46s%32s%d%8s", name, dev, &port, pkey_str) != 4)
+		if (sscanf(s, "%46s%31s%d%7s", name, dev, &port, pkey_str) != 4)
 			continue;
 
 		acm_log(2, "%s", s);
@@ -2457,8 +2477,10 @@ acm_open_port(struct acmc_port *port, struct acmc_device *dev, uint8_t port_num)
 
 	port->mad_agentid = umad_register(port->mad_portid,
 					  IB_MGMT_CLASS_SA, 1, 1, NULL);
-	if (port->mad_agentid < 0)
+	if (port->mad_agentid < 0) {
+		umad_close_port(port->mad_portid);
 		acm_log(0, "ERROR - unable to register MAD client\n");
+	}
 
 	port->prov = NULL;
 	port->state = IBV_PORT_DOWN;
@@ -2582,11 +2604,12 @@ static void acm_load_prov_config(void)
 				subnet = calloc(1, sizeof (*subnet));
 				if (!subnet) {
 					acm_log(0, "Error: out of memory\n");
+					fclose(fd);
 					return;
 				}
 				subnet->subnet_prefix = htobe64(prefix);
-				list_add_after(&provider_list, &prov->entry,
-						&subnet->entry);
+				list_add_tail(&prov->subnet_list,
+					      &subnet->entry);
 			}
 		}
 	}
@@ -2646,7 +2669,7 @@ static int acm_open_providers(void)
 
 		query = dlsym(handle, "provider_query");
 		if ((err_str = dlerror()) != NULL) {
-			acm_log(0, "Error -provider_query not found in %s (%s)\n",
+			acm_log(0, "Error - provider_query not found in %s (%s)\n",
 				file_name, err_str);
 			dlclose(handle);
 			continue;
@@ -2932,7 +2955,7 @@ static void acm_set_options(void)
 		if (s[0] == '#')
 			continue;
 
-		if (sscanf(s, "%32s%256s", opt, value) != 2)
+		if (sscanf(s, "%31s%255s", opt, value) != 2)
 			continue;
 
 		if (!strcasecmp("log_file", opt))

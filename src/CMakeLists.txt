@@ -22,8 +22,6 @@
 #      Produce static libraries along with the usual shared libraries.
 #  -DVERBS_PROVIDER_DIR='' (default /usr/lib.../libibverbs)
 #      Use the historical search path for providers, in the standard system library.
-#  -DKERNEL_DIR='.../linux' (default '')
-#      If set use the kernel UAPI headers from this kernel source tree.
 #  -DNO_COMPAT_SYMS=1 (default disabled)
 #      Do not generate backwards compatibility symbols in the shared
 #      libraries. This may is necessary if using a dynmic linker that does
@@ -48,11 +46,11 @@ endif()
 set(PACKAGE_NAME "RDMA")
 
 # See Documentation/versioning.md
-set(PACKAGE_VERSION "15")
+set(PACKAGE_VERSION "17.2")
 # When this is changed the values in these files need changing too:
 #   debian/libibverbs1.symbols
 #   libibverbs/libibverbs.map
-set(IBVERBS_PABI_VERSION "15")
+set(IBVERBS_PABI_VERSION "17")
 set(IBVERBS_PROVIDER_SUFFIX "-rdmav${IBVERBS_PABI_VERSION}.so")
 
 #-------------------------
@@ -250,11 +248,38 @@ CHECK_C_SOURCE_COMPILES("
   HAVE_FUNC_ATTRIBUTE_ALWAYS_INLINE
   FAIL_REGEX "warning")
 
+# Linux __u64 is an unsigned long long
+CHECK_C_SOURCE_COMPILES("
+#include <linux/types.h>
+ int main(int argc,const char *argv[]) { __u64 tmp = 0; unsigned long long *tmp2 = &tmp; return *tmp2; }"
+  HAVE_LONG_LONG_U64
+  FAIL_REGEX "warning")
+
+if (NOT HAVE_LONG_LONG_U64)
+  # Modern Linux has switched to use ull in all cases, but to avoid disturbing
+  # userspace some platforms continued to use unsigned long by default. This
+  # define will cause kernel headers to consistently use unsigned long long
+  add_definitions("-D__SANE_USERSPACE_TYPES__")
+endif()
+
+# glibc and kernel uapi headers can co-exist
+CHECK_C_SOURCE_COMPILES("
+ #include <sys/socket.h>
+ #include <netinet/in.h>
+ #include <linux/in.h>
+ #include <linux/in6.h>
+ int main(int argc,const char *argv[]) { return 0; }"
+  HAVE_GLIBC_UAPI_COMPAT)
+RDMA_DoFixup("${HAVE_GLIBC_UAPI_COMPAT}" "linux/in.h")
+RDMA_DoFixup("${HAVE_GLIBC_UAPI_COMPAT}" "linux/in6.h")
+
 # Provide a shim if C11 stdatomic.h is not supported.
 if (NOT HAVE_SPARSE)
   CHECK_INCLUDE_FILE("stdatomic.h" HAVE_STDATOMIC)
   RDMA_DoFixup("${HAVE_STDATOMIC}" "stdatomic.h")
 endif()
+
+RDMA_Check_SSE(HAVE_TARGET_SSE)
 
 # Enable development support features
 # Prune unneeded shared libraries during linking
@@ -278,6 +303,9 @@ if (NO_COMPAT_SYMS)
 else()
   set(HAVE_FULL_SYMBOL_VERSIONS 1)
 endif()
+
+# Look for Python
+FIND_PACKAGE (PythonInterp)
 
 #-------------------------
 # Find libraries
@@ -333,8 +361,6 @@ include_directories(${UDEV_INCLUDE_DIRS})
 # Statically determine sizeof(long), this is largely unnecessary, no new code
 # should rely on this.
 check_type_size("long" SIZEOF_LONG BUILTIN_TYPES_ONLY LANGUAGE C)
-
-include(RDMA_LinuxHeaders)
 
 # Determine if this arch supports cache coherent DMA. This isn't really an
 # arch specific property, but for our purposes arches that do not support it
@@ -419,6 +445,7 @@ add_subdirectory(ccan)
 add_subdirectory(util)
 add_subdirectory(Documentation)
 add_subdirectory(kernel-boot)
+add_subdirectory(kernel-headers)
 # Libraries
 add_subdirectory(libibumad)
 add_subdirectory(libibumad/man)
@@ -426,14 +453,13 @@ add_subdirectory(libibverbs)
 add_subdirectory(libibverbs/man)
 add_subdirectory(librdmacm)
 add_subdirectory(librdmacm/man)
-add_subdirectory(libibcm)
 
 # Providers
 if (HAVE_COHERENT_DMA)
 add_subdirectory(providers/bnxt_re)
 add_subdirectory(providers/cxgb3) # NO SPARSE
 add_subdirectory(providers/cxgb4) # NO SPARSE
-add_subdirectory(providers/hns) # NO SPARSE
+add_subdirectory(providers/hns)
 add_subdirectory(providers/i40iw) # NO SPARSE
 add_subdirectory(providers/mlx4)
 add_subdirectory(providers/mlx4/man)
@@ -456,7 +482,6 @@ add_subdirectory(ibacm) # NO SPARSE
 if (NOT NL_KIND EQUAL 0)
   add_subdirectory(iwpmd)
 endif()
-add_subdirectory(libibcm/examples)
 add_subdirectory(libibumad/tests)
 add_subdirectory(libibverbs/examples)
 add_subdirectory(librdmacm/examples)
@@ -505,7 +530,6 @@ endif()
 if (NOT UDEV_FOUND)
   message(STATUS " libudev NOT found (disabling features)")
 endif()
-rdma_report_missing_kheaders()
 if (NOT HAVE_C_WARNINGS)
   message(STATUS " extended C warnings NOT supported")
 endif()
@@ -520,4 +544,10 @@ if (NOT HAVE_C_WORKING_SHADOW)
 endif()
 if (NOT HAVE_C_WREDUNDANT_DECLS)
   message(STATUS " -Wredundant-decls does NOT work")
+endif()
+if (NOT HAVE_GLIBC_UAPI_COMPAT)
+  message(STATUS " libc netinet/in.h and linux/in.h do NOT coexist")
+endif()
+if (NOT HAVE_TARGET_SSE)
+  message(STATUS " attribute(target(\"sse\")) does NOT work")
 endif()

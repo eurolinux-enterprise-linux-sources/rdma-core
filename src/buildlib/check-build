@@ -9,6 +9,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import sys
+import copy
 from contextlib import contextmanager;
 
 def get_src_dir():
@@ -143,6 +145,51 @@ def test_verbs_private(args):
 
 # -------------------------------------------------------------------------
 
+def check_abi(args,fn):
+    g1 = re.match(r"lib([^.]+).so\.(.+)\.(.+)",fn);
+    g2 = re.match(r"lib([^.]+).so\.(.+\..+)",fn);
+    if g1 is None or g2 is None:
+        raise ValueError("Library has unknown file name format %r"%(fn));
+
+    ref_fn = os.path.join(args.SRC,"ABI",g1.group(1) + ".dump");
+    cur_fn = os.path.join(args.SRC,"ABI","current-" + g1.group(1) + ".dump");
+    subprocess.check_call(["abi-dumper",
+                           "-lver",g2.group(1),
+                           fn,
+                           "-o",cur_fn]);
+
+    if not os.path.exists(ref_fn):
+        print >> sys.stderr, "ABI file does not exist for %r"%(ref_fn);
+        return False;
+
+    subprocess.check_call(["abi-compliance-checker",
+                           "-l",g1.group(1),
+                           "-old",ref_fn,
+                           "-new",cur_fn]);
+
+    return True;
+
+def test_verbs_uapi(args):
+    """Compare the ABI output from 'abi-dumper' between what is present in git and
+    what was built in this tree.  This allows us to detect changes in ABI on
+    the -stable branch."""
+
+    # User must provide the ABI dir in the source tree
+    if not os.path.isdir(os.path.join(args.SRC,"ABI")):
+        print "ABI check skipped, no ABI/ directory.";
+        return;
+
+    libd = os.path.join(args.BUILD,"lib");
+    success = True;
+    with inDirectory(libd):
+        for fn in os.listdir("."):
+            if not os.path.islink(fn) and re.match(r"lib.+\.so\..+\..+",fn):
+                success = success & check_abi(args,fn);
+
+    assert success == True;
+
+# -------------------------------------------------------------------------
+
 def is_obsolete(fn):
     """True if the header is obsolete and should not be compiled anyhow."""
     with open(fn) as F:
@@ -158,31 +205,104 @@ def is_fixup(fn):
         return "buildlib/fixup-include/" in os.readlink(fn);
     return False;
 
-def test_public_headers(args):
-    """Test that every header file can be included on its own, and has no obvious
-    implicit dependencies. This is mainly intended to check the public
-    headers, but this sweeps in published internal headers too."""
-    incdir = os.path.abspath(os.path.join(args.BUILD,"include"));
+def get_headers(incdir):
     includes = set();
     for root,dirs,files in os.walk(incdir):
         for I in files:
             if I.endswith(".h"):
                 includes.add(os.path.join(root,I));
+    return includes;
+
+def compile_test_headers(tmpd,incdir,includes,with_cxx=False):
+    with open(os.path.join(tmpd,"build.ninja"),"wt") as F:
+        print >> F,"rule comp";
+        print >> F," command = %s -Werror -c -I %s $in -o $out"%(args.CC,incdir);
+        print >> F," description=Header check for $in";
+        print >> F,"rule comp_cxx";
+        print >> F," command = %s -Werror -c -I %s $in -o $out"%(args.CXX,incdir);
+        print >> F," description=Header C++ check for $in";
+        count = 0;
+        for I in sorted(includes):
+            if is_obsolete(I) or is_fixup(I):
+                continue;
+            print >> F,"build %s : comp %s"%("out%d.o"%(count),I);
+            print >> F,"default %s"%("out%d.o"%(count));
+            print >> F,"build %s : comp_cxx %s"%("outxx%d.o"%(count),I);
+            if with_cxx:
+                print >> F,"default %s"%("outxx%d.o"%(count));
+            count = count + 1;
+    subprocess.check_call(["ninja"],cwd=tmpd);
+
+def test_published_headers(args):
+    """Test that every header file can be included on its own, and has no obvious
+    implicit dependencies. This is intended as a first pass check of the public
+    installed API headers"""
+    incdir = os.path.abspath(os.path.join(args.BUILD,"include"));
+    includes = get_headers(incdir);
 
     # Make a little ninja file to compile each header
     with private_tmp() as tmpd:
-        with open(os.path.join(tmpd,"build.ninja"),"wt") as F:
-            print >> F,"rule comp";
-            print >> F," command = %s -Werror -c -I %s $in -o $out"%(args.CC,incdir);
-            print >> F," description=Header check for $in";
-            count = 0;
-            for I in sorted(includes):
-                if is_obsolete(I) or is_fixup(I):
-                    continue;
-                print >> F,"build %s : comp %s"%("out%d.o"%(count),I);
-                print >> F,"default %s"%("out%d.o"%(count));
-                count = count + 1;
-        subprocess.check_call(["ninja"],cwd=tmpd);
+        compile_test_headers(tmpd,incdir,includes);
+
+# -------------------------------------------------------------------------
+
+allowed_uapi_headers = {
+    # This header is installed in all supported distributions
+    "rdma/ib_user_sa.h",
+    "rdma/ib_user_verbs.h",
+}
+
+non_cxx_headers = {
+    "infiniband/arch.h",
+    "infiniband/ib.h",
+    "infiniband/opcode.h",
+    "infiniband/sa-kern-abi.h",
+    "infiniband/sa.h",
+    "rdma/rdma_cma_abi.h",
+}
+
+def test_installed_headers(args):
+    """This test also checks that the public headers can be compiled on their own,
+    but goes further and confirms that the public headers do not depend on any
+    internal headers, or kernel kAPI headers."""
+    with private_tmp() as tmpd:
+        env = copy.deepcopy(os.environ);
+        env["DESTDIR"] = tmpd;
+        subprocess.check_output(["ninja","install"],env=env);
+
+        includes = get_headers(tmpd);
+        incdir = os.path.commonprefix(includes);
+        rincludes = {I[len(incdir):] for I in includes};
+
+        bincdir = os.path.abspath(os.path.join(args.BUILD,"include"));
+        all_includes = set();
+        for I in get_headers(bincdir):
+            if not is_fixup(I) and not is_obsolete(I):
+                all_includes.add(I[len(bincdir)+1:]);
+
+        # Drop error includes for any include file that is internal, this way
+        # when we compile the public headers any include of an internal header
+        # will fail.
+        for I in sorted(all_includes - rincludes):
+            if I in allowed_uapi_headers:
+                continue;
+
+            I = os.path.join(incdir,I)
+            dfn = os.path.dirname(I);
+            if not os.path.isdir(dfn):
+                os.makedirs(dfn);
+            assert not os.path.exists(I);
+            with open(I,"w") as F:
+                print >> F,'#error "Private internal header"';
+
+        # Roughly check that the headers have the extern "C" for C++
+        # compilation.
+        for I in sorted(rincludes - non_cxx_headers):
+            with open(os.path.join(incdir,I)) as F:
+                if 'extern "C" {' not in F.read():
+                    raise ValueError("No extern C in %r"%(I));
+
+        compile_test_headers(tmpd,incdir,includes,with_cxx=True);
 
 # -------------------------------------------------------------------------
 
@@ -193,10 +313,13 @@ parser.add_argument("--src",default=None,dest="SRC",
                     help="Top of the source tree");
 parser.add_argument("--cc",default="cc",dest="CC",
                     help="C compiler to use");
+parser.add_argument("--cxx",default="c++",dest="CXX",
+                    help="C++ compiler to use");
 args = parser.parse_args();
 
 if args.SRC is None:
     args.SRC = get_src_dir();
+args.SRC = os.path.abspath(args.SRC);
 args.PACKAGE_VERSION = get_package_version(args);
 
 funcs = globals();

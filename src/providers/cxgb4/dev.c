@@ -48,23 +48,17 @@
 /*
  * Macros needed to support the PCI Device ID Table ...
  */
-#define CH_PCI_DEVICE_ID_TABLE_DEFINE_BEGIN \
-	static struct { \
-		unsigned vendor; \
-		unsigned device; \
-	} hca_table[] = {
+#define CH_PCI_DEVICE_ID_TABLE_DEFINE_BEGIN                                    \
+	static const struct verbs_match_ent hca_table[] = {
 
 #define CH_PCI_DEVICE_ID_FUNCTION \
 		0x4
 
-#define CH_PCI_ID_TABLE_ENTRY(__DeviceID) \
-		{ \
-			.vendor = PCI_VENDOR_ID_CHELSIO, \
-			.device = (__DeviceID), \
-		}
+#define CH_PCI_ID_TABLE_ENTRY(__DeviceID)                                      \
+	VERBS_PCI_MATCH(PCI_VENDOR_ID_CHELSIO, __DeviceID, NULL)
 
 #define CH_PCI_DEVICE_ID_TABLE_DEFINE_END \
-	}
+	{} }
 
 #include "t4_chip_type.h"
 #include "t4_pci_id_tbl.h"
@@ -77,7 +71,7 @@ int t5_en_wc = 1;
 
 static LIST_HEAD(devices);
 
-static struct ibv_context_ops c4iw_ctx_ops = {
+static const struct verbs_context_ops  c4iw_ctx_common_ops = {
 	.query_device = c4iw_query_device,
 	.query_port = c4iw_query_port,
 	.alloc_pd = c4iw_alloc_pd,
@@ -102,8 +96,16 @@ static struct ibv_context_ops c4iw_ctx_ops = {
 	.req_notify_cq = c4iw_arm_cq,
 };
 
-static struct ibv_context *c4iw_alloc_context(struct ibv_device *ibdev,
-					      int cmd_fd)
+static const struct verbs_context_ops c4iw_ctx_t4_ops = {
+	.async_event = c4iw_async_event,
+	.poll_cq = c4iw_poll_cq,
+	.post_recv = c4iw_post_receive,
+	.post_send = c4iw_post_send,
+	.req_notify_cq = c4iw_arm_cq,
+};
+
+static struct verbs_context *c4iw_alloc_context(struct ibv_device *ibdev,
+						int cmd_fd)
 {
 	struct c4iw_context *context;
 	struct ibv_get_context cmd;
@@ -113,12 +115,9 @@ static struct ibv_context *c4iw_alloc_context(struct ibv_device *ibdev,
 	uint64_t raw_fw_ver;
 	struct ibv_device_attr attr;
 
-	context = malloc(sizeof *context);
+	context = verbs_init_and_alloc_context(ibdev, cmd_fd, context, ibv_ctx);
 	if (!context)
 		return NULL;
-
-	memset(context, 0, sizeof *context);
-	context->ibv_ctx.cmd_fd = cmd_fd;
 
 	resp.status_page_size = 0;
 	resp.reserved = 0;
@@ -139,8 +138,7 @@ static struct ibv_context *c4iw_alloc_context(struct ibv_device *ibdev,
 			goto err_free;
 	} 
 
-	context->ibv_ctx.device = ibdev;
-	context->ibv_ctx.ops = c4iw_ctx_ops;
+	verbs_set_ops(&context->ibv_ctx, &c4iw_ctx_common_ops);
 
 	switch (rhp->chip_version) {
 	case CHELSIO_T6:
@@ -149,11 +147,7 @@ static struct ibv_context *c4iw_alloc_context(struct ibv_device *ibdev,
 		PDBG("%s T5/T4 device\n", __FUNCTION__);
 	case CHELSIO_T4:
 		PDBG("%s T4 device\n", __FUNCTION__);
-		context->ibv_ctx.ops.async_event = c4iw_async_event;
-		context->ibv_ctx.ops.post_send = c4iw_post_send;
-		context->ibv_ctx.ops.post_recv = c4iw_post_receive;
-		context->ibv_ctx.ops.poll_cq = c4iw_poll_cq;
-		context->ibv_ctx.ops.req_notify_cq = c4iw_arm_cq;
+		verbs_set_ops(&context->ibv_ctx, &c4iw_ctx_t4_ops);
 		break;
 	default:
 		PDBG("%s unknown hca type %d\n", __FUNCTION__,
@@ -165,8 +159,8 @@ static struct ibv_context *c4iw_alloc_context(struct ibv_device *ibdev,
 	if (!rhp->mmid2ptr) {
 		int ret;
 
-		ret = ibv_cmd_query_device(&context->ibv_ctx, &attr, &raw_fw_ver, &qcmd,
-					   sizeof qcmd);
+		ret = ibv_cmd_query_device(&context->ibv_ctx.context, &attr,
+					   &raw_fw_ver, &qcmd, sizeof(qcmd));
 		if (ret)
 			goto err_unmap;
 		rhp->max_mr = attr.max_mr;
@@ -207,6 +201,7 @@ err_free:
 		free(rhp->cqid2ptr);
 	if (rhp->mmid2ptr)
 		free(rhp->cqid2ptr);
+	verbs_uninit_context(&context->ibv_ctx);
 	free(context);
 	return NULL;
 }
@@ -217,6 +212,8 @@ static void c4iw_free_context(struct ibv_context *ibctx)
 
 	if (context->status_page_size)
 		munmap(context->status_page, context->status_page_size);
+
+	verbs_uninit_context(&context->ibv_ctx);
 	free(context);
 }
 
@@ -226,12 +223,6 @@ static void c4iw_uninit_device(struct verbs_device *verbs_device)
 
 	free(dev);
 }
-
-static struct verbs_device_ops c4iw_dev_ops = {
-	.alloc_context = c4iw_alloc_context,
-	.free_context = c4iw_free_context,
-	.uninit_device = c4iw_uninit_device
-};
 
 #ifdef STALL_DETECTION
 
@@ -405,47 +396,22 @@ void dump_state(void)
  */
 int c4iw_abi_version = 1;
 
-static struct verbs_device *cxgb4_driver_init(const char *uverbs_sys_path,
-					      int abi_version)
+static bool c4iw_device_match(struct verbs_sysfs_dev *sysfs_dev)
 {
-	char devstr[IBV_SYSFS_PATH_MAX], ibdev[16], value[32], *cp;
-	struct c4iw_dev *dev;
-	unsigned vendor, device, fw_maj, fw_min;
-	int i;
+	char value[32], *cp;
+	unsigned int fw_maj, fw_min;
 
-	if (ibv_read_sysfs_file(uverbs_sys_path, "device/vendor",
-				value, sizeof value) < 0)
-		return NULL;
-	sscanf(value, "%i", &vendor);
-
-	if (ibv_read_sysfs_file(uverbs_sys_path, "device/device",
-				value, sizeof value) < 0)
-		return NULL;
-	sscanf(value, "%i", &device);
-
-	for (i = 0; i < sizeof hca_table / sizeof hca_table[0]; ++i)
-		if (vendor == hca_table[i].vendor &&
-		    device == hca_table[i].device)
-			goto found;
-
-	return NULL;
-
-found:
-	c4iw_abi_version = abi_version;	
+	/* Rely on the core code to match PCI devices */
+	if (!sysfs_dev->match)
+		return false;
 
 	/*
 	 * Verify that the firmware major number matches.  Major number
 	 * mismatches are fatal.  Minor number mismatches are tolerated.
 	 */
-	if (ibv_read_sysfs_file(uverbs_sys_path, "ibdev",
-				ibdev, sizeof ibdev) < 0)
-		return NULL;
-
-	memset(devstr, 0, sizeof devstr);
-	snprintf(devstr, sizeof devstr, "%s/class/infiniband/%s",
-		 ibv_get_sysfs_path(), ibdev);
-	if (ibv_read_sysfs_file(devstr, "fw_ver", value, sizeof value) < 0)
-		return NULL;
+	if (ibv_read_sysfs_file(sysfs_dev->ibdev_path, "fw_ver", value,
+				sizeof(value)) < 0)
+		return false;
 
 	cp = strtok(value+1, ".");
 	sscanf(cp, "%i", &fw_maj);
@@ -457,7 +423,7 @@ found:
 			"Firmware major number is %u and libcxgb4 needs %u.\n",
 			fw_maj, FW_MAJ);
 		fflush(stderr);
-		return NULL;
+		return false;
 	}
 
 	DBGLOG("libcxgb4");
@@ -468,19 +434,25 @@ found:
 			fw_min, FW_MIN);
 		fflush(stderr);
 	}
+	return true;
+}
 
-	PDBG("%s found vendor %d device %d type %d\n",
-	     __FUNCTION__, vendor, device, CHELSIO_CHIP_VERSION(hca_table[i].device >> 8));
+static struct verbs_device *c4iw_device_alloc(struct verbs_sysfs_dev *sysfs_dev)
+{
+	struct c4iw_dev *dev;
+
+	c4iw_page_size = sysconf(_SC_PAGESIZE);
+	c4iw_page_shift = long_log2(c4iw_page_size);
+	c4iw_page_mask = ~(c4iw_page_size - 1);
 
 	dev = calloc(1, sizeof *dev);
-	if (!dev) {
+	if (!dev)
 		return NULL;
-	}
 
 	pthread_spin_init(&dev->lock, PTHREAD_PROCESS_PRIVATE);
-	dev->ibv_dev.ops = &c4iw_dev_ops;
-	dev->chip_version = CHELSIO_CHIP_VERSION(hca_table[i].device >> 8);
-	dev->abi_version = abi_version;
+	c4iw_abi_version = sysfs_dev->abi_ver;
+	dev->chip_version = CHELSIO_CHIP_VERSION(sysfs_dev->match->device >> 8);
+	dev->abi_version = sysfs_dev->abi_ver;
 	list_node_init(&dev->list);
 
 	PDBG("%s device claimed\n", __FUNCTION__);
@@ -515,13 +487,18 @@ found:
 	return &dev->ibv_dev;
 }
 
-static __attribute__((constructor)) void cxgb4_register_driver(void)
-{
-	c4iw_page_size = sysconf(_SC_PAGESIZE);
-	c4iw_page_shift = long_log2(c4iw_page_size);
-	c4iw_page_mask = ~(c4iw_page_size - 1);
-	verbs_register_driver("cxgb4", cxgb4_driver_init);
-}
+static const struct verbs_device_ops c4iw_dev_ops = {
+	.name = "cxgb4",
+	.match_min_abi_version = 0,
+	.match_max_abi_version = INT_MAX,
+	.match_table = hca_table,
+	.match_device = c4iw_device_match,
+	.alloc_device = c4iw_device_alloc,
+	.uninit_device = c4iw_uninit_device,
+	.alloc_context = c4iw_alloc_context,
+	.free_context = c4iw_free_context,
+};
+PROVIDER_DRIVER(c4iw_dev_ops);
 
 #ifdef STATS
 void __attribute__ ((destructor)) cs_fini(void);

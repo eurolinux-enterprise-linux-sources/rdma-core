@@ -50,12 +50,12 @@
 #include <rdma/vmw_pvrdma-abi.h>
 
 struct user_pvrdma_alloc_ucontext_resp {
-	struct ibv_get_context_resp		ibv_resp;
+	struct ib_uverbs_get_context_resp		ibv_resp;
 	struct pvrdma_alloc_ucontext_resp	udata;
 };
 
 struct user_pvrdma_alloc_pd_resp {
-	struct ibv_alloc_pd_resp	ibv_resp;
+	struct ib_uverbs_alloc_pd_resp	ibv_resp;
 	struct pvrdma_alloc_pd_resp	udata;
 };
 
@@ -65,8 +65,18 @@ struct user_pvrdma_create_cq {
 };
 
 struct user_pvrdma_create_cq_resp {
-	struct ibv_create_cq_resp	ibv_resp;
+	struct ib_uverbs_create_cq_resp	ibv_resp;
 	struct pvrdma_create_cq_resp	udata;
+};
+
+struct user_pvrdma_create_srq {
+	struct ibv_create_srq		ibv_cmd;
+	struct pvrdma_create_srq	udata;
+};
+
+struct user_pvrdma_create_srq_resp {
+	struct ib_uverbs_create_srq_resp	ibv_resp;
+	struct pvrdma_create_srq_resp	udata;
 };
 
 struct user_pvrdma_create_qp {

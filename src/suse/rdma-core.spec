@@ -19,21 +19,19 @@
 %bcond_without  systemd
 %define         git_ver %{nil}
 Name:           rdma-core
-Version:        15
+Version:        17.2
 Release:        0
 Summary:        RDMA core userspace libraries and daemons
 License:        GPL-2.0 or BSD-2-Clause
 Group:          Productivity/Networking/Other
 
 %define verbs_so_major  1
-%define ibcm_so_major   1
 %define rdmacm_so_major 1
 %define umad_so_major   3
 %define mlx4_so_major   1
 %define mlx5_so_major   1
 
 %define  verbs_lname  libibverbs%{verbs_so_major}
-%define  ibcm_lname   libibcm%{ibcm_so_major}
 %define  rdmacm_lname librdmacm%{rdmacm_so_major}
 %define  umad_lname   libibumad%{umad_so_major}
 %define  mlx4_lname   libmlx4-%{mlx4_so_major}
@@ -58,6 +56,7 @@ BuildRequires:  pkgconfig(libsystemd)
 BuildRequires:  pkgconfig(libudev)
 BuildRequires:  pkgconfig(systemd)
 BuildRequires:  pkgconfig(udev)
+BuildRequires:  python3-base
 %ifnarch s390 s390x
 BuildRequires:  valgrind-devel
 %endif
@@ -77,8 +76,20 @@ Obsoletes:      rdma < %{version}
 Provides:       ofed = %{version}
 Obsoletes:      ofed < %{version}
 
+# Trickery to handle both SUSE OpenBuild System and Manual build
+# In OBS, rdma-core must use curl-mini instead of curl to avoid
+# a build dependency loop:
+# rdma-core -> cmake -> curl -> ... -> boost -> rdma-core
+# Thus we force a BuildRequires to curl-mini which as no impact
+# as it is not used during the build.
+# However curl-mini is not a published RPM. This would prevent any build
+# outside of OBS. Thus we add a bcond to allow manual build.
+# To force build without the use of curl-mini, --without=curlmini
+# should be passed to rpmbuild
 %if 0%{?suse_version} >= 1330
+%if %{with curlmini}
 BuildRequires:  curl-mini
+%endif
 %endif
 
 # Tumbleweed's cmake RPM macro adds -Wl,--no-undefined to the module flags
@@ -110,7 +121,6 @@ Summary:        RDMA core development libraries and headers
 Group:          Development/Libraries/C and C++
 Requires:       %{name}%{?_isa} = %{version}-%{release}
 
-Requires:       %{ibcm_lname} = %{version}-%{release}
 Requires:       %{rdmacm_lname} = %{version}-%{release}
 Requires:       %{umad_lname} = %{version}-%{release}
 Requires:       %{verbs_lname} = %{version}-%{release}
@@ -122,9 +132,6 @@ Requires:       rsocket = %{version}-%{release}
 
 Provides:       libibverbs-devel = %{version}-%{release}
 Obsoletes:      libibverbs-devel < %{version}-%{release}
-
-Provides:       libibcm-devel = %{version}-%{release}
-Obsoletes:      libibcm-devel < %{version}-%{release}
 
 Provides:       libibumad-devel = %{version}-%{release}
 Obsoletes:      libibumad-devel < %{version}-%{release}
@@ -243,14 +250,6 @@ Requires:       %{name}%{?_isa} = %{version}
 iwpmd provides a userspace service for iWarp drivers to claim
 tcp ports through the standard socket interface.
 
-%package -n %ibcm_lname
-Summary:        Userspace InfiniBand Connection Manager
-Group:          System/Libraries
-
-%description -n %ibcm_lname
-libibcm provides a userspace library that handles the majority of the low
-level work required to open an RDMA connection between two machines.
-
 %package -n %umad_lname
 Summary:        OpenFabrics Alliance InfiniBand Userspace Management Datagram library
 Group:          System/Libraries
@@ -320,6 +319,8 @@ on those changes.
 %define _rundir /var/run
 %endif
 
+%{!?EXTRA_CMAKE_FLAGS: %define EXTRA_CMAKE_FLAGS %{nil}}
+
 # Pass all of the rpm paths directly to GNUInstallDirs and our other defines.
 %cmake %{CMAKE_FLAGS} \
 	 -DCMAKE_MODULE_LINKER_FLAGS="-Wl,--as-needed -Wl,-z,now" \
@@ -339,7 +340,8 @@ on those changes.
          -DCMAKE_INSTALL_INITDDIR:PATH=%{_initddir} \
          -DCMAKE_INSTALL_RUNDIR:PATH=%{_rundir} \
          -DCMAKE_INSTALL_DOCDIR:PATH=%{_docdir}/%{name}-%{version} \
-         -DCMAKE_INSTALL_UDEV_RULESDIR:PATH=%{_udevrulesdir}
+         -DCMAKE_INSTALL_UDEV_RULESDIR:PATH=%{_udevrulesdir} \
+         %{EXTRA_CMAKE_FLAGS}
 %make_jobs
 
 %install
@@ -395,9 +397,6 @@ rm -rf %{buildroot}/%{_sbindir}/srp_daemon.sh
 %postun -n %mlx5_lname -p /sbin/ldconfig
 %endif
 
-%post -n %ibcm_lname -p /sbin/ldconfig
-%postun -n %ibcm_lname -p /sbin/ldconfig
-
 %post -n %umad_lname -p /sbin/ldconfig
 %postun -n %umad_lname -p /sbin/ldconfig
 
@@ -428,20 +427,18 @@ rm -rf %{buildroot}/%{_sbindir}/srp_daemon.sh
 # srp daemon
 #
 %pre -n srp_daemon
-%service_add_pre srp_daemon.service srp_daemon_port@.service
+%service_add_pre srp_daemon.service
 
 %post -n srp_daemon
-%service_add_post srp_daemon.service srp_daemon_port@.service
+%service_add_post srp_daemon.service
 # we ship udev rules, so trigger an update.
 /sbin/udevadm trigger --subsystem-match=infiniband_mad --action=change
 
 %preun -n srp_daemon
 %service_del_preun srp_daemon.service
-%service_del_postun -n  srp_daemon_port@.service
 
 %postun -n srp_daemon
 %service_del_postun srp_daemon.service
-%service_del_postun -n  srp_daemon_port@.service
 
 #
 # iwpmd
@@ -544,6 +541,7 @@ rm -rf %{buildroot}/%{_sbindir}/srp_daemon.sh
 %doc %{_docdir}/%{name}-%{version}/libibverbs.md
 %doc %{_docdir}/%{name}-%{version}/rxe.md
 %doc %{_docdir}/%{name}-%{version}/udev.md
+%doc %{_docdir}/%{name}-%{version}/tag_matching.md
 %{_bindir}/rxe_cfg
 %{_mandir}/man7/rxe*
 %{_mandir}/man8/rxe*
@@ -595,11 +593,6 @@ rm -rf %{buildroot}/%{_sbindir}/srp_daemon.sh
 %{_udevrulesdir}/90-iwpmd.rules
 %{_mandir}/man8/iwpmd.*
 %{_mandir}/man5/iwpmd.*
-
-%files -n %ibcm_lname
-%defattr(-,root,root)
-%{_libdir}/libibcm*.so.*
-%doc %{_docdir}/%{name}-%{version}/libibcm.md
 
 %files -n %umad_lname
 %defattr(-,root,root)

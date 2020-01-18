@@ -76,6 +76,9 @@ struct bnxt_re_cq {
 	struct list_head rfhead;
 	uint32_t cqe_size;
 	uint8_t  phase;
+	int deferred_arm_flags;
+	bool first_arm;
+	bool deferred_arm;
 };
 
 struct bnxt_re_srq {
@@ -141,7 +144,7 @@ struct bnxt_re_dev {
 };
 
 struct bnxt_re_context {
-	struct ibv_context ibvctx;
+	struct verbs_context ibvctx;
 	uint32_t dev_id;
 	uint32_t max_qp;
 	uint32_t max_srq;
@@ -161,13 +164,13 @@ void bnxt_re_ring_cq_arm_db(struct bnxt_re_cq *cq, uint8_t aflag);
 /* pointer conversion functions*/
 static inline struct bnxt_re_dev *to_bnxt_re_dev(struct ibv_device *ibvdev)
 {
-	return container_of(ibvdev, struct bnxt_re_dev, vdev);
+	return container_of(ibvdev, struct bnxt_re_dev, vdev.device);
 }
 
 static inline struct bnxt_re_context *to_bnxt_re_context(
 		struct ibv_context *ibvctx)
 {
-	return container_of(ibvctx, struct bnxt_re_context, ibvctx);
+	return container_of(ibvctx, struct bnxt_re_context, ibvctx.context);
 }
 
 static inline struct bnxt_re_pd *to_bnxt_re_pd(struct ibv_pd *ibvpd)
@@ -366,9 +369,13 @@ static inline uint8_t bnxt_re_to_ibv_wc_status(uint8_t bnxt_wcst,
 static inline uint8_t bnxt_re_is_cqe_valid(struct bnxt_re_cq *cq,
 					   struct bnxt_re_bcqe *hdr)
 {
+	uint8_t valid = 0;
+
+	valid = ((le32toh(hdr->flg_st_typ_ph) &
+		  BNXT_RE_BCQE_PH_MASK) == cq->phase);
 	udma_from_device_barrier();
-	return ((le32toh(hdr->flg_st_typ_ph) &
-		 BNXT_RE_BCQE_PH_MASK) == cq->phase);
+
+	return valid;
 }
 
 static inline void bnxt_re_change_cq_phase(struct bnxt_re_cq *cq)

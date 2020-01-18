@@ -6,7 +6,7 @@ Section: net
 Priority: optional
 Build-Depends: cmake (>= 2.8.11),
                debhelper (>= 9),
-               dh-systemd,
+               debhelper (>= 9.20160709) | dh-systemd,
                dpkg-dev (>= 1.17),
                libnl-3-dev,
                libnl-route-3-dev,
@@ -15,15 +15,19 @@ Build-Depends: cmake (>= 2.8.11),
                ninja-build,
                pkg-config,
                python,
-               valgrind
-Standards-Version: 4.1.0
+               valgrind [!alpha !armel !hppa !ia64 !m68k !powerpcspe !sh4 !sparc64 !x32]
+Standards-Version: 4.1.3
 Vcs-Git: https://github.com/linux-rdma/rdma-core.git
 Vcs-Browser: https://github.com/linux-rdma/rdma-core
 Homepage: https://github.com/linux-rdma/rdma-core
 
 Package: rdma-core
 Architecture: linux-any
-Depends: lsb-base (>= 3.2-14~), ${misc:Depends}, ${shlibs:Depends}
+Depends: lsb-base (>= 3.2-14~),
+         udev,
+         ${misc:Depends},
+         ${perl:Depends},
+         ${shlibs:Depends}
 Recommends: dmidecode, ethtool, net-tools
 Breaks: infiniband-diags (<< 2.0.0)
 Replaces: infiniband-diags (<< 2.0.0)
@@ -41,7 +45,7 @@ Description: RDMA core userspace infrastructure and documentation
     standard socket interface.
 
 Package: ibacm
-Architecture: any
+Architecture: linux-any
 Depends: lsb-base (>= 3.2-14~),
          rdma-core (>= 15),
          ${misc:Depends},
@@ -57,7 +61,7 @@ Description: InfiniBand Communication Manager Assistant (ACM)
 Package: ibverbs-providers
 Architecture: linux-any
 Multi-Arch: same
-Depends: ${misc:Depends}, ${perl:Depends}, ${shlibs:Depends}
+Depends: ${misc:Depends}, ${shlibs:Depends}
 Provides: libcxgb3-1, libipathverbs1, libmlx4-1, libmlx5-1, libmthca1, libnes1
 Replaces: libcxgb3-1, libipathverbs1, libmlx4-1, libmlx5-1, libmthca1, libnes1
 Breaks: libcxgb3-1, libipathverbs1, libmlx4-1, libmlx5-1, libmthca1, libnes1
@@ -134,7 +138,7 @@ Section: libs
 Pre-Depends: ${misc:Pre-Depends}
 Depends: adduser, ${misc:Depends}, ${shlibs:Depends}
 Recommends: ibverbs-providers
-Breaks: ibverbs-providers (<< 14)
+Breaks: ibverbs-providers (<< 16~)
 Description: Library for direct userspace use of RDMA (InfiniBand/iWARP)
  libibverbs is a library that allows userspace processes to use RDMA
  "verbs" as described in the InfiniBand Architecture Specification and
@@ -152,7 +156,6 @@ Description: Library for direct userspace use of RDMA (InfiniBand/iWARP)
 
 Package: libibverbs1-dbg
 Section: debug
-Priority: extra
 Architecture: linux-any
 Multi-Arch: same
 Depends: libibverbs1 (= ${binary:Version}), ${misc:Depends}
@@ -170,47 +173,10 @@ Description: Debug symbols for the libibverbs library
  libibverbs1. They will automatically be used by gdb for debugging
  libibverbs-related issues.
 
-Package: libibcm-dev
-Section: libdevel
-Architecture: linux-any
-Depends: libibcm1 (= ${binary:Version}), libibverbs-dev, ${misc:Depends}
-Description: Development files for the libibcm library
- libibcm provides a userspace implementation of an InfiniBand
- Communication Manager (CM). The CM handles both connection
- establishment as well as service ID resolution.
- .
- This package is needed to compile programs against libibcm1.
- It contains the header files and static libraries (optionally)
- needed for compiling.
-
-Package: libibcm1
-Architecture: linux-any
-Section: libs
-Depends: ${misc:Depends}, ${shlibs:Depends}
-Description: InfiniBand Communication Manager (CM) library
- libibcm provides a userspace implementation of an InfiniBand
- Communication Manager (CM). The CM handles both connection
- establishment as well as service ID resolution.
- .
- This package contains the shared library.
-
-Package: libibcm1-dbg
-Section: debug
-Priority: extra
-Architecture: linux-any
-Depends: libibcm1 (= ${binary:Version}), ${misc:Depends}
-Description: Debug symbols for the libibcm1 library
- libibcm provides a userspace implementation of an InfiniBand
- Communication Manager (CM). The CM handles both connection
- establishment as well as service ID resolution.
- .
- This package contains the debug symbols associated with
- libibcm1. They will automatically be used by gdb for debugging
- libibcm-related issues.
-
 Package: libibumad-dev
 Section: libdevel
 Architecture: linux-any
+Multi-Arch: same
 Depends: libibumad3 (= ${binary:Version}), ${misc:Depends}
 Description: Development files for libibumad
  libibumad provides userspace Infiniband Management Datagram (uMAD)
@@ -223,6 +189,7 @@ Description: Development files for libibumad
 
 Package: libibumad3
 Architecture: linux-any
+Multi-Arch: same
 Section: libs
 Pre-Depends: ${misc:Pre-Depends}
 Depends: ${misc:Depends}, ${shlibs:Depends}
@@ -235,7 +202,6 @@ Description: InfiniBand Userspace Management Datagram (uMAD) library
 
 Package: libibumad3-dbg
 Section: debug
-Priority: extra
 Architecture: linux-any
 Depends: libibumad3 (= ${binary:Version}), ${misc:Depends}
 Description: Debug symbols for the libibumad3 library
@@ -250,6 +216,7 @@ Description: Debug symbols for the libibumad3 library
 Package: librdmacm-dev
 Section: libdevel
 Architecture: linux-any
+Multi-Arch: same
 Depends: libibverbs-dev, librdmacm1 (= ${binary:Version}), ${misc:Depends}
 Description: Development files for the librdmacm library
  librdmacm is a library that allows applications to set up reliable
@@ -271,6 +238,7 @@ Description: Development files for the librdmacm library
 
 Package: librdmacm1
 Architecture: linux-any
+Multi-Arch: same
 Section: libs
 Pre-Depends: ${misc:Pre-Depends}
 Depends: ${misc:Depends}, ${shlibs:Depends}
@@ -292,7 +260,6 @@ Description: Library for managing RDMA connections
 
 Package: librdmacm1-dbg
 Section: debug
-Priority: extra
 Architecture: linux-any
 Depends: librdmacm1 (= ${binary:Version}), ${misc:Depends}
 Description: Debug symbols for the librdmacm library
@@ -337,6 +304,7 @@ Package: srptools
 Architecture: linux-any
 Depends: lsb-base (>= 3.2-14~),
          rdma-core (>= 15),
+         udev,
          ${misc:Depends},
          ${shlibs:Depends}
 Description: Tools for Infiniband attached storage (SRP)

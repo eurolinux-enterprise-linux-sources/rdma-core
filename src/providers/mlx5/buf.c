@@ -51,7 +51,7 @@ static int mlx5_bitmap_init(struct mlx5_bitmap *bitmap, uint32_t num,
 	bitmap->avail = num;
 	bitmap->mask = mask;
 	bitmap->avail = bitmap->max;
-	bitmap->table = calloc(BITS_TO_LONGS(bitmap->max), sizeof(uint32_t));
+	bitmap->table = calloc(BITS_TO_LONGS(bitmap->max), sizeof(*bitmap->table));
 	if (!bitmap->table)
 		return -ENOMEM;
 
@@ -538,7 +538,7 @@ int mlx5_alloc_buf_contig(struct mlx5_context *mctx,
 	int block_size_exp;
 	int max_block_log;
 	int min_block_log;
-	struct ibv_context *context = &mctx->ibv_ctx;
+	struct ibv_context *context = &mctx->ibv_ctx.context;
 	off_t offset;
 
 	mlx5_alloc_get_env_info(&max_block_log,

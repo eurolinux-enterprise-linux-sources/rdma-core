@@ -64,14 +64,9 @@
 uint32_t qelr_dp_level;
 uint32_t qelr_dp_module;
 
-#define QHCA(d)					\
-	{ .vendor = PCI_VENDOR_ID_QLOGIC,	\
-	  .device = PCI_DEVICE_ID_QLOGIC_##d }
-
-static const struct {
-	unsigned int vendor;
-	unsigned int device;
-} hca_table[] = {
+#define QHCA(d)                                                                \
+	VERBS_PCI_MATCH(PCI_VENDOR_ID_QLOGIC, PCI_DEVICE_ID_QLOGIC_##d, NULL)
+static const struct verbs_match_ent hca_table[] = {
 	QHCA(57980S),
 	QHCA(57980S_40),
 	QHCA(57980S_10),
@@ -82,12 +77,10 @@ static const struct {
 	QHCA(57980S_IOV),
 	QHCA(AH),
 	QHCA(AH_IOV),
+	{}
 };
 
-static struct ibv_context *qelr_alloc_context(struct ibv_device *, int);
-static void qelr_free_context(struct ibv_context *);
-
-static struct ibv_context_ops qelr_ctx_ops = {
+static const struct verbs_context_ops qelr_ctx_ops = {
 	.query_device = qelr_query_device,
 	.query_port = qelr_query_port,
 	.alloc_pd = qelr_alloc_pd,
@@ -114,12 +107,6 @@ static void qelr_uninit_device(struct verbs_device *verbs_device)
 
 	free(dev);
 }
-
-static struct verbs_device_ops qelr_dev_ops = {
-	.alloc_context = qelr_alloc_context,
-	.free_context = qelr_free_context,
-	.uninit_device = qelr_uninit_device
-};
 
 static void qelr_open_debug_file(struct qelr_devctx *ctx)
 {
@@ -168,19 +155,18 @@ static void qelr_set_debug_mask(void)
 		qelr_dp_module = atoi(env);
 }
 
-static struct ibv_context *qelr_alloc_context(struct ibv_device *ibdev,
-					      int cmd_fd)
+static struct verbs_context *qelr_alloc_context(struct ibv_device *ibdev,
+						int cmd_fd)
 {
 	struct qelr_devctx *ctx;
 	struct qelr_get_context cmd;
 	struct qelr_alloc_ucontext_resp resp;
 
-	ctx = calloc(1, sizeof(struct qelr_devctx));
+	ctx = verbs_init_and_alloc_context(ibdev, cmd_fd, ctx, ibv_ctx);
 	if (!ctx)
 		return NULL;
-	memset(&resp, 0, sizeof(resp));
 
-	ctx->ibv_ctx.cmd_fd = cmd_fd;
+	memset(&resp, 0, sizeof(resp));
 
 	qelr_open_debug_file(ctx);
 	qelr_set_debug_mask();
@@ -190,9 +176,9 @@ static struct ibv_context *qelr_alloc_context(struct ibv_device *ibdev,
 				&resp.ibv_resp, sizeof(resp)))
 		goto cmd_err;
 
+	verbs_set_ops(&ctx->ibv_ctx, &qelr_ctx_ops);
+
 	ctx->kernel_page_size = sysconf(_SC_PAGESIZE);
-	ctx->ibv_ctx.device = ibdev;
-	ctx->ibv_ctx.ops = qelr_ctx_ops;
 	ctx->db_pa = resp.db_pa;
 	ctx->db_size = resp.db_size;
 	ctx->max_send_wr = resp.max_send_wr;
@@ -218,6 +204,7 @@ static struct ibv_context *qelr_alloc_context(struct ibv_device *ibdev,
 cmd_err:
 	qelr_err("%s: Failed to allocate context for device.\n", __func__);
 	qelr_close_debug_file(ctx);
+	verbs_uninit_context(&ctx->ibv_ctx);
 	free(ctx);
 	return NULL;
 }
@@ -230,57 +217,29 @@ static void qelr_free_context(struct ibv_context *ibctx)
 		munmap(ctx->db_addr, ctx->db_size);
 
 	qelr_close_debug_file(ctx);
+	verbs_uninit_context(&ctx->ibv_ctx);
 	free(ctx);
 }
 
-static struct verbs_device *qelr_driver_init(const char *uverbs_sys_path,
-					     int abi_version)
+static struct verbs_device *qelr_device_alloc(struct verbs_sysfs_dev *sysfs_dev)
 {
-	char value[16];
 	struct qelr_device *dev;
-	unsigned int vendor, device;
-	int i;
-
-	if (ibv_read_sysfs_file(uverbs_sys_path, "device/vendor",
-				value, sizeof(value)) < 0)
-		return NULL;
-
-	sscanf(value, "%i", &vendor);
-
-	if (ibv_read_sysfs_file(uverbs_sys_path, "device/device",
-				value, sizeof(value)) < 0)
-		return NULL;
-
-	sscanf(value, "%i", &device);
-
-	for (i = 0; i < sizeof(hca_table) / sizeof(hca_table[0]); ++i)
-		if (vendor == hca_table[i].vendor &&
-		    device == hca_table[i].device)
-			goto found;
-
-	return NULL;
-found:
-	if (abi_version != QELR_ABI_VERSION) {
-		fprintf(stderr,
-			"Fatal: libqedr ABI version %d of %s is not supported.\n",
-			abi_version, uverbs_sys_path);
-		return NULL;
-	}
 
 	dev = calloc(1, sizeof(*dev));
-	if (!dev) {
-		qelr_err("%s() Fatal: fail allocate device for libqedr\n",
-			 __func__);
+	if (!dev)
 		return NULL;
-	}
-
-	dev->ibv_dev.ops = &qelr_dev_ops;
 
 	return &dev->ibv_dev;
 }
 
-static __attribute__ ((constructor))
-void qelr_register_driver(void)
-{
-	verbs_register_driver("qelr", qelr_driver_init);
-}
+static const struct verbs_device_ops qelr_dev_ops = {
+	.name = "qedr",
+	.match_min_abi_version = QELR_ABI_VERSION,
+	.match_max_abi_version = QELR_ABI_VERSION,
+	.match_table = hca_table,
+	.alloc_device = qelr_device_alloc,
+	.uninit_device = qelr_uninit_device,
+	.alloc_context = qelr_alloc_context,
+	.free_context = qelr_free_context,
+};
+PROVIDER_DRIVER(qelr_dev_ops);

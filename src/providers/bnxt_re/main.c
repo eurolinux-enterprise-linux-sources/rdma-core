@@ -52,36 +52,35 @@
 
 #define PCI_VENDOR_ID_BROADCOM		0x14E4
 
-#define CNA(v, d)					\
-	{	.vendor = PCI_VENDOR_ID_##v,		\
-		.device = d }
-
-static const struct {
-	unsigned int vendor;
-	unsigned int device;
-} cna_table[] = {
+#define CNA(v, d) VERBS_PCI_MATCH(PCI_VENDOR_ID_##v, d, NULL)
+static const struct verbs_match_ent cna_table[] = {
+	CNA(BROADCOM, 0x1605),  /* BCM57454 NPAR */
+	CNA(BROADCOM, 0x1606),  /* BCM57454 VF */
 	CNA(BROADCOM, 0x1614),  /* BCM57454 */
 	CNA(BROADCOM, 0x16C0),  /* BCM57417 NPAR */
+	CNA(BROADCOM, 0x16C1),  /* BMC57414 VF */
 	CNA(BROADCOM, 0x16CE),  /* BMC57311 */
 	CNA(BROADCOM, 0x16CF),  /* BMC57312 */
-	CNA(BROADCOM, 0x16DF),  /* BMC57314 */
-	CNA(BROADCOM, 0x16E5),  /* BMC57314 VF */
-	CNA(BROADCOM, 0x16E2),  /* BMC57417 */
-	CNA(BROADCOM, 0x16E3),  /* BMC57416 */
 	CNA(BROADCOM, 0x16D6),  /* BMC57412*/
 	CNA(BROADCOM, 0x16D7),  /* BMC57414 */
 	CNA(BROADCOM, 0x16D8),  /* BMC57416 Cu */
 	CNA(BROADCOM, 0x16D9),  /* BMC57417 Cu */
-	CNA(BROADCOM, 0x16C1),  /* BMC57414 VF */
-	CNA(BROADCOM, 0x16EF),  /* BCM57416 NPAR */
+	CNA(BROADCOM, 0x16DF),  /* BMC57314 */
+	CNA(BROADCOM, 0x16E2),  /* BMC57417 */
+	CNA(BROADCOM, 0x16E3),  /* BMC57416 */
+	CNA(BROADCOM, 0x16E5),  /* BMC57314 VF */
 	CNA(BROADCOM, 0x16ED),  /* BCM57414 NPAR */
 	CNA(BROADCOM, 0x16EB),  /* BCM57412 NPAR */
+	CNA(BROADCOM, 0x16EF),  /* BCM57416 NPAR */
 	CNA(BROADCOM, 0x16F0),  /* BCM58730 */
 	CNA(BROADCOM, 0x16F1),  /* BCM57452 */
-	CNA(BROADCOM, 0xD802)   /* BCM58802 */
+	CNA(BROADCOM, 0xD800),  /* BCM880xx VF */
+	CNA(BROADCOM, 0xD802),  /* BCM58802 */
+	CNA(BROADCOM, 0xD804),   /* BCM8804 SR */
+	{}
 };
 
-static struct ibv_context_ops bnxt_re_cntx_ops = {
+static const struct verbs_context_ops bnxt_re_cntx_ops = {
 	.query_device  = bnxt_re_query_device,
 	.query_port    = bnxt_re_query_port,
 	.alloc_pd      = bnxt_re_alloc_pd,
@@ -110,22 +109,22 @@ static struct ibv_context_ops bnxt_re_cntx_ops = {
 };
 
 /* Context Init functions */
-static int bnxt_re_init_context(struct verbs_device *vdev,
-				struct ibv_context *ibvctx, int cmd_fd)
+static struct verbs_context *bnxt_re_alloc_context(struct ibv_device *vdev,
+						   int cmd_fd)
 {
 	struct ibv_get_context cmd;
 	struct bnxt_re_cntx_resp resp;
-	struct bnxt_re_dev *dev;
+	struct bnxt_re_dev *dev = to_bnxt_re_dev(vdev);
 	struct bnxt_re_context *cntx;
 
-	dev = to_bnxt_re_dev(&vdev->device);
-	cntx = to_bnxt_re_context(ibvctx);
+	cntx = verbs_init_and_alloc_context(vdev, cmd_fd, cntx, ibvctx);
+	if (!cntx)
+		return NULL;
 
 	memset(&resp, 0, sizeof(resp));
-	ibvctx->cmd_fd = cmd_fd;
-	if (ibv_cmd_get_context(ibvctx, &cmd, sizeof(cmd),
+	if (ibv_cmd_get_context(&cntx->ibvctx, &cmd, sizeof(cmd),
 				&resp.resp, sizeof(resp)))
-		return errno;
+		goto failed;
 
 	cntx->dev_id = resp.dev_id;
 	cntx->max_qp = resp.max_qp;
@@ -142,22 +141,21 @@ static int bnxt_re_init_context(struct verbs_device *vdev,
 	}
 	pthread_mutex_init(&cntx->shlock, NULL);
 
-	ibvctx->ops = bnxt_re_cntx_ops;
+	verbs_set_ops(&cntx->ibvctx, &bnxt_re_cntx_ops);
 
-	return 0;
+	return &cntx->ibvctx;
+
 failed:
-	fprintf(stderr, DEV "Failed to allocate context for device\n");
-	return errno;
+	verbs_uninit_context(&cntx->ibvctx);
+	free(cntx);
+	return NULL;
 }
 
-static void bnxt_re_uninit_context(struct verbs_device *vdev,
-				   struct ibv_context *ibvctx)
+static void bnxt_re_free_context(struct ibv_context *ibvctx)
 {
-	struct bnxt_re_dev *dev;
-	struct bnxt_re_context *cntx;
+	struct bnxt_re_context *cntx = to_bnxt_re_context(ibvctx);
+	struct bnxt_re_dev *dev = to_bnxt_re_dev(ibvctx->device);
 
-	dev = to_bnxt_re_dev(&vdev->device);
-	cntx = to_bnxt_re_context(ibvctx);
 	/* Unmap if anything device specific was mapped in init_context. */
 	pthread_mutex_destroy(&cntx->shlock);
 	if (cntx->shpg)
@@ -172,60 +170,30 @@ static void bnxt_re_uninit_context(struct verbs_device *vdev,
 		munmap(cntx->udpi.dbpage, dev->pg_size);
 		cntx->udpi.dbpage = NULL;
 	}
+
+	verbs_uninit_context(&cntx->ibvctx);
+	free(cntx);
 }
 
-static struct verbs_device_ops bnxt_re_dev_ops = {
-	.init_context = bnxt_re_init_context,
-	.uninit_context = bnxt_re_uninit_context,
-};
-
-static struct verbs_device *bnxt_re_driver_init(const char *uverbs_sys_path,
-						int abi_version)
+static struct verbs_device *
+bnxt_re_device_alloc(struct verbs_sysfs_dev *sysfs_dev)
 {
-	char value[10];
 	struct bnxt_re_dev *dev;
-	unsigned int vendor, device;
-	int i;
-
-	if (ibv_read_sysfs_file(uverbs_sys_path, "device/vendor",
-				value, sizeof(value)) < 0)
-		return NULL;
-	vendor = strtol(value, NULL, 16);
-
-	if (ibv_read_sysfs_file(uverbs_sys_path, "device/device",
-				value, sizeof(value)) < 0)
-		return NULL;
-	device = strtol(value, NULL, 16);
-
-	for (i = 0; i < sizeof(cna_table) / sizeof(cna_table[0]); ++i)
-		if (vendor == cna_table[i].vendor &&
-		    device == cna_table[i].device)
-			goto found;
-	return NULL;
-found:
-	if (abi_version != BNXT_RE_ABI_VERSION) {
-		fprintf(stderr, DEV "FATAL: Max supported ABI of %s is %d "
-			"check for the latest version of kernel driver and"
-			"user library\n", uverbs_sys_path, abi_version);
-		return NULL;
-	}
 
 	dev = calloc(1, sizeof(*dev));
-	if (!dev) {
-		fprintf(stderr, DEV "Failed to allocate device for %s\n",
-			uverbs_sys_path);
+	if (!dev)
 		return NULL;
-	}
-
-	dev->vdev.sz = sizeof(*dev);
-	dev->vdev.size_of_context =
-		sizeof(struct bnxt_re_context) - sizeof(struct ibv_context);
-	dev->vdev.ops = &bnxt_re_dev_ops;
 
 	return &dev->vdev;
 }
 
-static __attribute__((constructor)) void bnxt_re_register_driver(void)
-{
-	verbs_register_driver("bnxt_re", bnxt_re_driver_init);
-}
+static const struct verbs_device_ops bnxt_re_dev_ops = {
+	.name = "bnxt_re",
+	.match_min_abi_version = BNXT_RE_ABI_VERSION,
+	.match_max_abi_version = BNXT_RE_ABI_VERSION,
+	.match_table = cna_table,
+	.alloc_device = bnxt_re_device_alloc,
+	.alloc_context = bnxt_re_alloc_context,
+	.free_context = bnxt_re_free_context,
+};
+PROVIDER_DRIVER(bnxt_re_dev_ops);

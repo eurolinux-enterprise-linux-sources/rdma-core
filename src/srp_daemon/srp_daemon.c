@@ -1103,7 +1103,7 @@ static int get_shared_pkeys(struct resources *res,
 	int i, num_pkeys = 0;
 	uint16_t pkey;
 	uint16_t local_port_lid = get_port_lid(res->ud_res->ib_ctx,
-					       config->port_num);
+					       config->port_num, NULL);
 
 	in_mad_buf = malloc(sizeof(struct ib_user_mad) +
 			    node_table_response_size);
@@ -1945,12 +1945,12 @@ static struct resources *alloc_res(void)
 				     run_thread_get_trap_notices, &res->res);
 		if (ret)
 			goto err;
-	}
 
-	ret = pthread_create(&res->res.async_ev_thread, NULL,
-			     run_thread_listen_to_events, &res->res);
-	if (ret)
-		goto err;
+		ret = pthread_create(&res->res.async_ev_thread, NULL,
+				     run_thread_listen_to_events, &res->res);
+		if (ret)
+			goto err;
+	}
 
 	if (config->retry_timeout && !config->once) {
 		ret = pthread_create(&res->res.reconnect_thread, NULL,
@@ -2073,12 +2073,6 @@ static int ibsrpdm(int argc, char *argv[])
 	if (ret)
 		pr_err("Querying SRP targets failed\n");
 
-	assert(res->sync_res);
-	pthread_mutex_lock(&res->sync_res->retry_mutex);
-	res->sync_res->stop_threads = 1;
-	pthread_cond_signal(&res->sync_res->retry_cond);
-	pthread_mutex_unlock(&res->sync_res->retry_mutex);
-
 	free_res(res);
 umad_done:
 	umad_done();
@@ -2092,7 +2086,7 @@ int main(int argc, char *argv[])
 {
 	int			ret;
 	struct resources       *res;
-	uint16_t 		lid;
+	uint16_t                lid, sm_lid;
 	uint16_t 		pkey;
 	union umad_gid 		gid;
 	struct target_details  *target;
@@ -2196,8 +2190,10 @@ catas_start:
 
 			pr_debug("Starting a recalculation\n");
 			port_lid = get_port_lid(res->ud_res->ib_ctx,
-					   config->port_num);
-			if (port_lid != res->ud_res->port_attr.lid) {
+						config->port_num, &sm_lid);
+			if (port_lid != res->ud_res->port_attr.lid ||
+				sm_lid != res->ud_res->port_attr.sm_lid) {
+
 				if (res->ud_res->ah) {
 					ibv_destroy_ah(res->ud_res->ah);
 					res->ud_res->ah = NULL;
@@ -2212,7 +2208,7 @@ catas_start:
 			if (res->ud_res->ah) {
 				if (register_to_traps(res, 1))
 					pr_err("Fail to register to traps, maybe there "
-					       "is no opensm running on fabric or IB port is down\n");
+					       "is no SM running on fabric or IB port is down\n");
 				else
 					subscribed = 1;
 			}
@@ -2346,7 +2342,7 @@ static int recalc(struct resources *res)
 
 	umad_res->sm_lid = strtol(val, NULL, 0);
 	if (umad_res->sm_lid == 0) {
-		pr_err("SM LID is 0, maybe no opensm is running\n");
+		pr_err("SM LID is 0, maybe no SM is running\n");
 		return -1;
 	}
 
