@@ -42,7 +42,7 @@ F:	*/lib*.map
 F:	buildlib/
 
 DEBIAN PACKAGING
-M:	Benjamin Drung <benjamin.drung@profitbricks.com>
+M:	Benjamin Drung <benjamin.drung@cloud.ionos.com>
 S:	Supported
 F:	debian/
 
@@ -151,8 +151,9 @@ S:	Supported
 F:	providers/ocrdma/
 
 QEDR USERSPACE PROVIDER (for qedr.ko)
-M:	Ram Amrani <Ram.Amrani@cavium.com>
-M:	Ariel Elior <Ariel.Elior@cavium.com>
+M:	Yuval Bason <yuval.bason@cavium.com>
+M:	Michal Kalderon <michal.kalderon@cavium.com>
+M:	Ariel Elior <ariel.elior@cavium.com>
 S:	Supported
 F:	providers/qedr/
 

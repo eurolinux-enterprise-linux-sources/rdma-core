@@ -358,6 +358,12 @@ int mlx4_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				ctrl->srcrb_flags |= htobe32(MLX4_WQE_CTRL_IP_HDR_CSUM |
 							   MLX4_WQE_CTRL_TCP_UDP_CSUM);
 			}
+			/* Take the dmac from the payload - needed for loopback */
+			if (qp->link_layer == IBV_LINK_LAYER_ETHERNET) {
+				ctrl->srcrb_flags16[0] = *(__be16 *)(uintptr_t)wr->sg_list[0].addr;
+				ctrl->imm = *(__be32 *)((uintptr_t)(wr->sg_list[0].addr) + 2);
+			}
+
 			break;
 
 		default:
@@ -619,7 +625,7 @@ static int num_inline_segs(int data, enum ibv_qp_type type)
 }
 
 void mlx4_calc_sq_wqe_size(struct ibv_qp_cap *cap, enum ibv_qp_type type,
-			   struct mlx4_qp *qp)
+			   struct mlx4_qp *qp, struct ibv_qp_init_attr_ex *attr)
 {
 	int size;
 	int max_sq_sge;
@@ -666,6 +672,9 @@ void mlx4_calc_sq_wqe_size(struct ibv_qp_cap *cap, enum ibv_qp_type type,
 		size = sizeof (struct mlx4_wqe_bind_seg);
 
 	size += sizeof (struct mlx4_wqe_ctrl_seg);
+
+	if (attr->comp_mask & IBV_QP_INIT_ATTR_MAX_TSO_HEADER)
+		size += align(sizeof (struct mlx4_wqe_lso_seg) + attr->max_tso_header, 16);
 
 	for (qp->sq.wqe_shift = 6; 1 << qp->sq.wqe_shift < size;
 	     qp->sq.wqe_shift++)

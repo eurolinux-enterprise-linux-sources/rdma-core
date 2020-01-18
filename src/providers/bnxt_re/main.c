@@ -110,26 +110,28 @@ static const struct verbs_context_ops bnxt_re_cntx_ops = {
 
 /* Context Init functions */
 static struct verbs_context *bnxt_re_alloc_context(struct ibv_device *vdev,
-						   int cmd_fd)
+						   int cmd_fd,
+						   void *private_data)
 {
 	struct ibv_get_context cmd;
-	struct bnxt_re_cntx_resp resp;
+	struct ubnxt_re_cntx_resp resp;
 	struct bnxt_re_dev *dev = to_bnxt_re_dev(vdev);
 	struct bnxt_re_context *cntx;
 
-	cntx = verbs_init_and_alloc_context(vdev, cmd_fd, cntx, ibvctx);
+	cntx = verbs_init_and_alloc_context(vdev, cmd_fd, cntx, ibvctx,
+					    RDMA_DRIVER_BNXT_RE);
 	if (!cntx)
 		return NULL;
 
 	memset(&resp, 0, sizeof(resp));
 	if (ibv_cmd_get_context(&cntx->ibvctx, &cmd, sizeof(cmd),
-				&resp.resp, sizeof(resp)))
+				&resp.ibv_resp, sizeof(resp)))
 		goto failed;
 
 	cntx->dev_id = resp.dev_id;
 	cntx->max_qp = resp.max_qp;
 	dev->pg_size = resp.pg_size;
-	dev->cqe_size = resp.cqe_size;
+	dev->cqe_size = resp.cqe_sz;
 	dev->max_cq_depth = resp.max_cqd;
 	pthread_spin_init(&cntx->fqlock, PTHREAD_PROCESS_PRIVATE);
 	/* mmap shared page. */
@@ -166,7 +168,6 @@ static void bnxt_re_free_context(struct ibv_context *ibvctx)
 	 * allocated in this context.
 	 */
 	if (cntx->udpi.dbpage && cntx->udpi.dbpage != MAP_FAILED) {
-		pthread_spin_destroy(&cntx->udpi.db_lock);
 		munmap(cntx->udpi.dbpage, dev->pg_size);
 		cntx->udpi.dbpage = NULL;
 	}
@@ -196,4 +197,4 @@ static const struct verbs_device_ops bnxt_re_dev_ops = {
 	.alloc_context = bnxt_re_alloc_context,
 	.free_context = bnxt_re_free_context,
 };
-PROVIDER_DRIVER(bnxt_re_dev_ops);
+PROVIDER_DRIVER(bnxt_re, bnxt_re_dev_ops);

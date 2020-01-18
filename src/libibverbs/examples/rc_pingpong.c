@@ -57,14 +57,17 @@ enum {
 
 static int page_size;
 static int use_odp;
+static int prefetch_mr;
 static int use_ts;
 static int validate_buf;
+static int use_dm;
 
 struct pingpong_context {
 	struct ibv_context	*context;
 	struct ibv_comp_channel *channel;
 	struct ibv_pd		*pd;
 	struct ibv_mr		*mr;
+	struct ibv_dm		*dm;
 	union {
 		struct ibv_cq		*cq;
 		struct ibv_cq_ex	*cq_ex;
@@ -369,7 +372,7 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 		goto clean_comp_channel;
 	}
 
-	if (use_odp || use_ts) {
+	if (use_odp || use_ts || use_dm) {
 		const uint32_t rc_caps_mask = IBV_ODP_SUPPORT_SEND |
 					      IBV_ODP_SUPPORT_RECV;
 		struct ibv_device_attr_ex attrx;
@@ -395,12 +398,53 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 			}
 			ctx->completion_timestamp_mask = attrx.completion_timestamp_mask;
 		}
+
+		if (use_dm) {
+			struct ibv_alloc_dm_attr dm_attr = {};
+
+			if (!attrx.max_dm_size) {
+				fprintf(stderr, "Device doesn't support dm allocation\n");
+				goto clean_pd;
+			}
+
+			if (attrx.max_dm_size < size) {
+				fprintf(stderr, "Device memory is insufficient\n");
+				goto clean_pd;
+			}
+
+			dm_attr.length = size;
+			ctx->dm = ibv_alloc_dm(ctx->context, &dm_attr);
+			if (!ctx->dm) {
+				fprintf(stderr, "Dev mem allocation failed\n");
+				goto clean_pd;
+			}
+
+			access_flags |= IBV_ACCESS_ZERO_BASED;
+		}
 	}
-	ctx->mr = ibv_reg_mr(ctx->pd, ctx->buf, size, access_flags);
+
+	ctx->mr = use_dm ? ibv_reg_dm_mr(ctx->pd, ctx->dm, 0, size, access_flags) :
+			   ibv_reg_mr(ctx->pd, ctx->buf, size, access_flags);
 
 	if (!ctx->mr) {
 		fprintf(stderr, "Couldn't register MR\n");
-		goto clean_pd;
+		goto clean_dm;
+	}
+
+	if (prefetch_mr) {
+		struct ibv_sge sg_list;
+		int ret;
+
+		sg_list.lkey = ctx->mr->lkey;
+		sg_list.addr = (uintptr_t)ctx->buf;
+		sg_list.length = size;
+
+		ret = ibv_advise_mr(ctx->pd, IBV_ADVISE_MR_ADVICE_PREFETCH_WRITE,
+				    IB_UVERBS_ADVISE_MR_FLAG_FLUSH,
+				    &sg_list, 1);
+
+		if (ret)
+			fprintf(stderr, "Couldn't prefetch MR(%d). Continue anyway\n", ret);
 	}
 
 	if (use_ts) {
@@ -478,6 +522,10 @@ clean_cq:
 clean_mr:
 	ibv_dereg_mr(ctx->mr);
 
+clean_dm:
+	if (ctx->dm)
+		ibv_free_dm(ctx->dm);
+
 clean_pd:
 	ibv_dealloc_pd(ctx->pd);
 
@@ -514,6 +562,13 @@ static int pp_close_ctx(struct pingpong_context *ctx)
 		return 1;
 	}
 
+	if (ctx->dm) {
+		if (ibv_free_dm(ctx->dm)) {
+			fprintf(stderr, "Couldn't free DM\n");
+			return 1;
+		}
+	}
+
 	if (ibv_dealloc_pd(ctx->pd)) {
 		fprintf(stderr, "Couldn't deallocate PD\n");
 		return 1;
@@ -540,7 +595,7 @@ static int pp_close_ctx(struct pingpong_context *ctx)
 static int pp_post_recv(struct pingpong_context *ctx, int n)
 {
 	struct ibv_sge list = {
-		.addr	= (uintptr_t) ctx->buf,
+		.addr	= use_dm ? 0 : (uintptr_t) ctx->buf,
 		.length = ctx->size,
 		.lkey	= ctx->mr->lkey
 	};
@@ -562,7 +617,7 @@ static int pp_post_recv(struct pingpong_context *ctx, int n)
 static int pp_post_send(struct pingpong_context *ctx)
 {
 	struct ibv_sge list = {
-		.addr	= (uintptr_t) ctx->buf,
+		.addr	= use_dm ? 0 : (uintptr_t) ctx->buf,
 		.length = ctx->size,
 		.lkey	= ctx->mr->lkey
 	};
@@ -679,8 +734,10 @@ static void usage(const char *argv0)
 	printf("  -e, --events           sleep on CQ events (default poll)\n");
 	printf("  -g, --gid-idx=<gid index> local port gid index\n");
 	printf("  -o, --odp		    use on demand paging\n");
+	printf("  -P, --prefetch	    prefetch an ODP MR\n");
 	printf("  -t, --ts	            get CQE with timestamp\n");
 	printf("  -c, --chk	            validate received buffer\n");
+	printf("  -j, --dm	            use device memory\n");
 }
 
 int main(int argc, char *argv[])
@@ -725,12 +782,14 @@ int main(int argc, char *argv[])
 			{ .name = "events",   .has_arg = 0, .val = 'e' },
 			{ .name = "gid-idx",  .has_arg = 1, .val = 'g' },
 			{ .name = "odp",      .has_arg = 0, .val = 'o' },
+			{ .name = "prefetch", .has_arg = 0, .val = 'P' },
 			{ .name = "ts",       .has_arg = 0, .val = 't' },
 			{ .name = "chk",      .has_arg = 0, .val = 'c' },
+			{ .name = "dm",       .has_arg = 0, .val = 'j' },
 			{}
 		};
 
-		c = getopt_long(argc, argv, "p:d:i:s:m:r:n:l:eg:otc",
+		c = getopt_long(argc, argv, "p:d:i:s:m:r:n:l:eg:oPtcj",
 				long_options, NULL);
 
 		if (c == -1)
@@ -792,11 +851,18 @@ int main(int argc, char *argv[])
 		case 'o':
 			use_odp = 1;
 			break;
+		case 'P':
+			prefetch_mr = 1;
+			break;
 		case 't':
 			use_ts = 1;
 			break;
 		case 'c':
 			validate_buf = 1;
+			break;
+
+		case 'j':
+			use_dm = 1;
 			break;
 
 		default:
@@ -809,6 +875,16 @@ int main(int argc, char *argv[])
 		servername = strdupa(argv[optind]);
 	else if (optind < argc) {
 		usage(argv[0]);
+		return 1;
+	}
+
+	if (use_odp && use_dm) {
+		fprintf(stderr, "DM memory region can't be on demand\n");
+		return 1;
+	}
+
+	if (!use_odp && prefetch_mr) {
+		fprintf(stderr, "prefetch is valid only with on-demand memory region\n");
 		return 1;
 	}
 
@@ -915,6 +991,13 @@ int main(int argc, char *argv[])
 		if (validate_buf)
 			for (int i = 0; i < size; i += page_size)
 				ctx->buf[i] = i / page_size % sizeof(char);
+
+		if (use_dm)
+			if (ibv_memcpy_to_dm(ctx->dm, 0, (void *)ctx->buf, size)) {
+				fprintf(stderr, "Copy to dm buffer failed\n");
+				return 1;
+			}
+
 		if (pp_post_send(ctx)) {
 			fprintf(stderr, "Couldn't post send\n");
 			return 1;
@@ -1038,6 +1121,11 @@ int main(int argc, char *argv[])
 		}
 
 		if ((!servername) && (validate_buf)) {
+			if (use_dm)
+				if (ibv_memcpy_from_dm(ctx->buf, ctx->dm, 0, size)) {
+					fprintf(stderr, "Copy from DM buffer failed\n");
+					return 1;
+				}
 			for (int i = 0; i < size; i += page_size)
 				if (ctx->buf[i] != i / page_size % sizeof(char))
 					printf("invalid data in page %d\n",

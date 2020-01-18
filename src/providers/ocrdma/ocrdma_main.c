@@ -106,13 +106,15 @@ static void ocrdma_uninit_device(struct verbs_device *verbs_device)
  * ocrdma_alloc_context
  */
 static struct verbs_context *ocrdma_alloc_context(struct ibv_device *ibdev,
-						  int cmd_fd)
+						  int cmd_fd,
+						  void *private_data)
 {
 	struct ocrdma_devctx *ctx;
-	struct ocrdma_get_context cmd;
-	struct ocrdma_alloc_ucontext_resp resp;
+	struct uocrdma_get_context cmd;
+	struct uocrdma_get_context_resp resp;
 
-	ctx = verbs_init_and_alloc_context(ibdev, cmd_fd, ctx, ibv_ctx);
+	ctx = verbs_init_and_alloc_context(ibdev, cmd_fd, ctx, ibv_ctx,
+					   RDMA_DRIVER_OCRDMA);
 	if (!ctx)
 		return NULL;
 
@@ -193,4 +195,4 @@ static const struct verbs_device_ops ocrdma_dev_ops = {
 	.alloc_context = ocrdma_alloc_context,
 	.free_context = ocrdma_free_context,
 };
-PROVIDER_DRIVER(ocrdma_dev_ops);
+PROVIDER_DRIVER(ocrdma, ocrdma_dev_ops);

@@ -17,9 +17,13 @@
 
 
 %bcond_without  systemd
+# Do not build static libs by default.
+%define with_static %{?_with_static: 1} %{?!_with_static: 0}
+%define with_pyverbs %{?_with_pyverbs: 1} %{?!_with_pyverbs: 0}
+
 %define         git_ver %{nil}
 Name:           rdma-core
-Version:        17.2
+Version:        22.1
 Release:        0
 Summary:        RDMA core userspace libraries and daemons
 License:        GPL-2.0 or BSD-2-Clause
@@ -51,12 +55,17 @@ Source1:        baselibs.conf
 BuildRequires:  binutils
 BuildRequires:  cmake >= 2.8.11
 BuildRequires:  gcc
+BuildRequires:  pandoc
 BuildRequires:  pkgconfig
 BuildRequires:  pkgconfig(libsystemd)
 BuildRequires:  pkgconfig(libudev)
 BuildRequires:  pkgconfig(systemd)
 BuildRequires:  pkgconfig(udev)
 BuildRequires:  python3-base
+%if %{with_pyverbs}
+BuildRequires:  python3-devel
+BuildRequires:  python3-Cython
+%endif
 %ifnarch s390 s390x
 BuildRequires:  valgrind-devel
 %endif
@@ -86,6 +95,7 @@ Obsoletes:      ofed < %{version}
 # outside of OBS. Thus we add a bcond to allow manual build.
 # To force build without the use of curl-mini, --without=curlmini
 # should be passed to rpmbuild
+%bcond_without curlmini
 %if 0%{?suse_version} >= 1330
 %if %{with curlmini}
 BuildRequires:  curl-mini
@@ -124,7 +134,7 @@ Requires:       %{name}%{?_isa} = %{version}-%{release}
 Requires:       %{rdmacm_lname} = %{version}-%{release}
 Requires:       %{umad_lname} = %{version}-%{release}
 Requires:       %{verbs_lname} = %{version}-%{release}
-%%if 0%{?dma_coherent}
+%if 0%{?dma_coherent}
 Requires:       %{mlx4_lname} = %{version}-%{release}
 Requires:       %{mlx5_lname} = %{version}-%{release}
 %endif
@@ -141,6 +151,13 @@ Obsoletes:      librdmacm-devel < %{version}-%{release}
 #Requires:       ibacm = %%{version}-%%{release}
 Provides:       ibacm-devel = %{version}-%{release}
 Obsoletes:      ibacm-devel < %{version}-%{release}
+%if %{with_static}
+# Since our pkg-config files include private references to these packages they
+# need to have their .pc files installed too, even for dynamic linking, or
+# pkg-config breaks.
+BuildRequires: pkgconfig(libnl-3.0)
+BuildRequires: pkgconfig(libnl-route-3.0)
+%endif
 
 %description devel
 RDMA core development libraries and headers.
@@ -164,6 +181,9 @@ Obsoletes:      librxe-rdmav2 < %{version}-%{release}
 Requires:       %{mlx4_lname} = %{version}-%{release}
 Requires:       %{mlx5_lname} = %{version}-%{release}
 %endif
+# Recommended packages for rxe_cfg
+Recommends:     ethtool
+Recommends:     iproute2
 
 %description -n libibverbs
 libibverbs is a library that allows userspace processes to use RDMA
@@ -263,6 +283,8 @@ are used by the IB diagnostic and management tools, including OpenSM.
 Summary:        Userspace RDMA Connection Manager
 Group:          System/Libraries
 Requires:       %{name} = %{version}
+Provides:       librdmacm = %{version}
+Obsoletes:      librdmacm < %{version}
 
 %description -n %rdmacm_lname
 librdmacm provides a userspace RDMA Communication Management API.
@@ -308,6 +330,14 @@ rdma-ndd is a system daemon which watches for rdma device changes and/or
 hostname changes and updates the Node Description of the rdma devices based
 on those changes.
 
+%package -n python3-pyverbs
+Summary:        Python3 API over IB verbs
+Group:          Development/Languages/Python
+
+%description -n python3-pyverbs
+Pyverbs is a Cython-based Python API over libibverbs, providing an
+easy, object-oriented access to IB verbs.
+
 %prep
 %setup -q -n  %{name}-%{version}%{git_ver}
 
@@ -341,7 +371,19 @@ on those changes.
          -DCMAKE_INSTALL_RUNDIR:PATH=%{_rundir} \
          -DCMAKE_INSTALL_DOCDIR:PATH=%{_docdir}/%{name}-%{version} \
          -DCMAKE_INSTALL_UDEV_RULESDIR:PATH=%{_udevrulesdir} \
-         %{EXTRA_CMAKE_FLAGS}
+%if %{with_static}
+         -DENABLE_STATIC=1 \
+%endif
+         %{EXTRA_CMAKE_FLAGS} \
+%if %{defined __python3}
+         -DPYTHON_EXECUTABLE:PATH=%{__python3} \
+         -DCMAKE_INSTALL_PYTHON_ARCH_LIB:PATH=%{python3_sitearch} \
+%endif
+%if %{with_pyverbs}
+         -DNO_PYVERBS=0
+%else
+	 -DNO_PYVERBS=1
+%endif
 %make_jobs
 
 %install
@@ -519,7 +561,11 @@ rm -rf %{buildroot}/%{_sbindir}/srp_daemon.sh
 %dir %{_includedir}/rdma
 %{_includedir}/infiniband/*
 %{_includedir}/rdma/*
+%if %{with_static}
+%{_libdir}/lib*.a
+%endif
 %{_libdir}/lib*.so
+%{_libdir}/pkgconfig/*.pc
 %{_mandir}/man3/ibv_*
 %{_mandir}/man3/rdma*
 %{_mandir}/man3/umad*
@@ -666,5 +712,10 @@ rm -rf %{buildroot}/%{_sbindir}/srp_daemon.sh
 %{_unitdir}/rdma-ndd.service
 %{_mandir}/man8/rdma-ndd.8*
 %{_libexecdir}/udev/rules.d/60-rdma-ndd.rules
+
+%if %{with_pyverbs}
+%files -n python3-pyverbs
+%{python3_sitearch}/pyverbs
+%endif
 
 %changelog

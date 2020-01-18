@@ -50,7 +50,11 @@ static const char *opts_file = ACM_OPTS_FILE;
 
 static char *dest_addr;
 static char *src_addr;
+#if IBACM_SERVER_MODE_DEFAULT == IBACM_SERVER_MODE_UNIX
+static const char *svc_arg = IBACM_IBACME_SERVER_PATH;
+#else
 static const char *svc_arg = "localhost";
+#endif
 static char *dest_arg;
 static char *src_arg;
 static char addr_type = 'u';
@@ -191,6 +195,38 @@ static void gen_opts_temp(FILE *f)
 	fprintf(f, "# client applications.\n");
 	fprintf(f, "\n");
 	fprintf(f, "server_port 6125\n");
+	fprintf(f, "\n");
+	fprintf(f, "# server_mode:\n");
+	fprintf(f, "# Selects how clients can connect to this server:\n");
+	fprintf(f, "# unix - Use unix-domain sockets,");
+	fprintf(f, " hence limits service to the same machine.\n");
+	fprintf(f, "# loop - Limit incoming connections");
+	fprintf(f, " for server_port to 127.0.0.1.\n");
+	fprintf(f, "# open - Allow incoming connections");
+	fprintf(f, " from any TCP client (internal or external).\n");
+	fprintf(f, "\n");
+#if IBACM_SERVER_MODE_DEFAULT == IBACM_SERVER_MODE_OPEN
+	fprintf(f, "server_mode open\n");
+#elif IBACM_SERVER_MODE_DEFAULT == IBACM_SERVER_MODE_LOOP
+	fprintf(f, "server_mode loop\n");
+#else
+	fprintf(f, "server_mode unix\n");
+#endif
+	fprintf(f, "\n");
+	fprintf(f, "# acme_plus_kernel_only:\n");
+	fprintf(f, "# If set to 'true', 'yes' or a non-zero number\n");
+	fprintf(f, "# ibacm will only serve requests originating\n");
+	fprintf(f, "# from the kernel or the ib_acme utility.\n");
+	fprintf(f, "# Please note that this option is ignored if the ibacm\n");
+	fprintf(f, "# service is started on demand by systemd,\n");
+	fprintf(f, "# in which case this option is treated\n");
+	fprintf(f, "# as if it were set to 'no'\n");
+	fprintf(f, "\n");
+#if IBACM_ACME_PLUS_KERNEL_ONLY_DEFAULT
+	fprintf(f, "acme_plus_kernel_only yes\n");
+#else
+	fprintf(f, "acme_plus_kernel_only no\n");
+#endif
 	fprintf(f, "\n");
 	fprintf(f, "# timeout:\n");
 	fprintf(f, "# Additional time, in milliseconds, that the ACM service will wait for a\n");
@@ -693,17 +729,17 @@ static char *get_dest(char *arg, char *format)
 	}
 }
 
-static void resolve(char *svc)
+static int resolve(char *svc)
 {
 	char **dest_list, **src_list;
 	struct ibv_path_record path;
-	int ret = 0, d = 0, s = 0, i;
+	int ret = -1, d = 0, s = 0, i;
 	char dest_type;
 
 	dest_list = parse(dest_arg, NULL);
 	if (!dest_list) {
 		printf("Unable to parse destination argument\n");
-		return;
+		return ret;
 	}
 
 	src_list = src_arg ? parse(src_arg, NULL) : NULL;
@@ -741,7 +777,7 @@ static void resolve(char *svc)
 			if (!ret)
 				show_path(&path);
 
-			if (verify)
+			if (!ret && verify)
 				ret = verify_resolve(&path);
 			printf("\n");
 
@@ -751,6 +787,8 @@ static void resolve(char *svc)
 	}
 
 	free(dest_list);
+
+	return ret;
 }
 
 static int query_perf_ip(uint64_t **counters, int *cnt)
@@ -890,7 +928,7 @@ static int enumerate_ep(char *svc, int index)
 	struct acm_ep_config_data *ep_data;
 
 	ret = ib_acm_enum_ep(index, &ep_data);
-	if (ret) 
+	if (ret)
 		return ret;
 
 	if (!labels) {
@@ -900,7 +938,7 @@ static int enumerate_ep(char *svc, int index)
 
 	printf("%s,0x%016" PRIx64 ",%d,0x%04x,%d,%s", svc, ep_data->dev_guid,
 	       ep_data->port_num, ep_data->pkey, index, ep_data->prov_name);
-	for (i = 0; i < ep_data->addr_cnt; i++) 
+	for (i = 0; i < ep_data->addr_cnt; i++)
 		printf(",%s", ep_data->addrs[i].name);
 	printf("\n");
 	ib_acm_free_ep_data(ep_data);
@@ -940,12 +978,12 @@ static int query_svcs(void)
 		}
 
 		if (dest_arg)
-			resolve(svc_list[i]);
+			ret = resolve(svc_list[i]);
 
 		if (perf_query)
 			query_perf(svc_list[i]);
 
-		if (enum_ep) 
+		if (enum_ep)
 			enumerate_eps(svc_list[i]);
 
 		ib_acm_disconnect();
@@ -976,7 +1014,7 @@ static void parse_perf_arg(char *arg)
 		perf_query = PERF_QUERY_EP_ADDR;
 	} else {
 		ep_index = atoi(arg);
-		if (ep_index > 0) 
+		if (ep_index > 0)
 			perf_query = PERF_QUERY_EP_INDEX;
 		else
 			perf_query = PERF_QUERY_ROW;
@@ -1050,7 +1088,7 @@ int main(int argc, char **argv)
 	}
 
 	if ((src_arg && (!dest_arg && perf_query != PERF_QUERY_EP_ADDR)) ||
-	    (perf_query == PERF_QUERY_EP_ADDR && !src_arg) || 
+	    (perf_query == PERF_QUERY_EP_ADDR && !src_arg) ||
 	    (!src_arg && !dest_arg && !perf_query && !make_addr && !make_opts &&
 	     !enum_ep))
 		goto show_use;

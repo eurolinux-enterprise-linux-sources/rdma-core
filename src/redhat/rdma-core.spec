@@ -1,5 +1,5 @@
 Name: rdma-core
-Version: 17.2
+Version: 22.1
 Release: 1%{?dist}
 Summary: RDMA core userspace libraries and daemons
 
@@ -10,6 +10,8 @@ Summary: RDMA core userspace libraries and daemons
 License: GPLv2 or BSD
 Url: https://github.com/linux-rdma/rdma-core
 Source: rdma-core-%{version}.tgz
+# Do not build static libs by default.
+%define with_static %{?_with_static: 1} %{?!_with_static: 0}
 
 BuildRequires: binutils
 BuildRequires: cmake >= 2.8.11
@@ -21,7 +23,16 @@ BuildRequires: pkgconfig(libnl-route-3.0)
 BuildRequires: valgrind-devel
 BuildRequires: systemd
 BuildRequires: systemd-devel
+%define with_pyverbs %{?_with_pyverbs: 1} %{?!_with_pyverbs: 0}
+%if %{with_pyverbs}
+BuildRequires: python3-devel
+BuildRequires: python3-Cython
+%else
 BuildRequires: python
+%endif
+%if 0%{?fedora} >= 21
+BuildRequires: perl-generators
+%endif
 
 Requires: dracut, kmod, systemd
 # Red Hat/Fedora previously shipped redhat/ as a stand-alone
@@ -45,6 +56,11 @@ BuildRequires: make
 %define cmake_install DESTDIR=%{buildroot} make install
 %endif
 
+%if 0%{?fedora} >= 25
+# pandoc was introduced in FC25
+BuildRequires: pandoc
+%endif
+
 %description
 RDMA core userspace infrastructure and documentation, including initialization
 scripts, kernel driver-specific modprobe override configs, IPoIB network
@@ -65,6 +81,13 @@ Obsoletes: librdmacm-devel < %{version}-%{release}
 Requires: ibacm = %{version}-%{release}
 Provides: ibacm-devel = %{version}-%{release}
 Obsoletes: ibacm-devel < %{version}-%{release}
+%if %{with_static}
+# Since our pkg-config files include private references to these packages they
+# need to have their .pc files installed too, even for dynamic linking, or
+# pkg-config breaks.
+BuildRequires: pkgconfig(libnl-3.0)
+BuildRequires: pkgconfig(libnl-route-3.0)
+%endif
 
 %description devel
 RDMA core development libraries and headers.
@@ -194,6 +217,14 @@ Requires: %{name}%{?_isa} = %{version}-%{release}
 In conjunction with the kernel ib_srp driver, srp_daemon allows you to
 discover and use SCSI devices via the SCSI RDMA Protocol over InfiniBand.
 
+%package -n python3-pyverbs
+Summary: Python3 API over IB verbs
+%{?python_provide:%python_provide python3-pyverbs}
+
+%description -n python3-pyverbs
+Pyverbs is a Cython-based Python API over libibverbs, providing an
+easy, object-oriented access to IB verbs.
+
 %prep
 %setup
 
@@ -225,7 +256,19 @@ discover and use SCSI devices via the SCSI RDMA Protocol over InfiniBand.
          -DCMAKE_INSTALL_RUNDIR:PATH=%{_rundir} \
          -DCMAKE_INSTALL_DOCDIR:PATH=%{_docdir}/%{name}-%{version} \
          -DCMAKE_INSTALL_UDEV_RULESDIR:PATH=%{_udevrulesdir} \
-         %{EXTRA_CMAKE_FLAGS}
+%if %{with_static}
+         -DENABLE_STATIC=1 \
+%endif
+         %{EXTRA_CMAKE_FLAGS} \
+%if %{defined __python3}
+         -DPYTHON_EXECUTABLE:PATH=%{__python3} \
+         -DCMAKE_INSTALL_PYTHON_ARCH_LIB:PATH=%{python3_sitearch} \
+%endif
+%if %{with_pyverbs}
+         -DNO_PYVERBS=0
+%else
+	 -DNO_PYVERBS=1
+%endif
 %make_jobs
 
 %install
@@ -344,7 +387,11 @@ rm -rf %{buildroot}/%{_sbindir}/srp_daemon.sh
 %dir %{_includedir}/rdma
 %{_includedir}/infiniband/*
 %{_includedir}/rdma/*
+%if %{with_static}
+%{_libdir}/lib*.a
+%endif
 %{_libdir}/lib*.so
+%{_libdir}/pkgconfig/*.pc
 %{_mandir}/man3/ibv_*
 %{_mandir}/man3/rdma*
 %{_mandir}/man3/umad*
@@ -445,3 +492,8 @@ rm -rf %{buildroot}/%{_sbindir}/srp_daemon.sh
 %{_mandir}/man5/srp_daemon.service.5*
 %{_mandir}/man5/srp_daemon_port@.service.5*
 %doc %{_docdir}/%{name}-%{version}/ibsrpdm.md
+
+%if %{with_pyverbs}
+%files -n python3-pyverbs
+%{python3_sitearch}/pyverbs
+%endif

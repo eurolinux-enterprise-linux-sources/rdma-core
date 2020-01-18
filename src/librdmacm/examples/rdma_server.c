@@ -36,6 +36,7 @@
 #include <rdma/rdma_cma.h>
 #include <rdma/rdma_verbs.h>
 
+static const char *server = "0.0.0.0";
 static const char *port = "7471";
 
 static struct rdma_cm_id *listen_id, *id;
@@ -55,7 +56,7 @@ static int run(void)
 	memset(&hints, 0, sizeof hints);
 	hints.ai_flags = RAI_PASSIVE;
 	hints.ai_port_space = RDMA_PS_TCP;
-	ret = rdma_getaddrinfo(NULL, port, &hints, &res);
+	ret = rdma_getaddrinfo(server, port, &hints, &res);
 	if (ret) {
 		printf("rdma_getaddrinfo: %s\n", gai_strerror(ret));
 		return ret;
@@ -163,13 +164,17 @@ int main(int argc, char **argv)
 {
 	int op, ret;
 
-	while ((op = getopt(argc, argv, "p:")) != -1) {
+	while ((op = getopt(argc, argv, "s:p:")) != -1) {
 		switch (op) {
+		case 's':
+			server = optarg;
+			break;
 		case 'p':
 			port = optarg;
 			break;
 		default:
 			printf("usage: %s\n", argv[0]);
+			printf("\t[-s server_address]\n");
 			printf("\t[-p port_number]\n");
 			exit(1);
 		}

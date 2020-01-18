@@ -669,7 +669,7 @@ int main(int argc, char *argv[])
 			{}
 		};
 
-		c = getopt_long(argc, argv, "p:d:i:s:m:q:r:n:l:eg:c:",
+		c = getopt_long(argc, argv, "p:d:i:s:m:q:r:n:l:eg:c",
 				long_options, NULL);
 		if (c == -1)
 			break;
@@ -756,6 +756,12 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "rx_depth %d is too small for %d QPs -- "
 			"must have at least one receive per QP.\n",
 			rx_depth, num_qp);
+		return 1;
+	}
+
+	if (num_qp >= MAX_QP) {
+		fprintf(stderr, "num_qp %d must be less than %d\n", num_qp,
+			MAX_QP - 1);
 		return 1;
 	}
 
