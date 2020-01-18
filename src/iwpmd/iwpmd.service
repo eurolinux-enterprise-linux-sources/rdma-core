@@ -1,0 +1,12 @@
+[Unit]
+Description=iWarp Port Mapper
+Documentation=man:iwpmd file:/etc/iwpmd.conf
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/iwpmd
+LimitNOFILE=102400
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
