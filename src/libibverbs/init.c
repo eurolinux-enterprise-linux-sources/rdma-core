@@ -47,39 +47,37 @@
 #include <errno.h>
 #include <assert.h>
 
+#include <ccan/list.h>
 #include <util/util.h>
 #include "ibverbs.h"
-
-#pragma GCC diagnostic ignored "-Wmissing-prototypes"
 
 int abi_ver;
 
 struct ibv_sysfs_dev {
+	struct list_node	entry;
 	char		        sysfs_name[IBV_SYSFS_NAME_MAX];
 	char		        ibdev_name[IBV_SYSFS_NAME_MAX];
 	char		        sysfs_path[IBV_SYSFS_PATH_MAX];
 	char		        ibdev_path[IBV_SYSFS_PATH_MAX];
-	struct ibv_sysfs_dev   *next;
 	int			abi_ver;
-	int			have_driver;
+	struct timespec		time_created;
 };
 
 struct ibv_driver_name {
+	struct list_node	entry;
 	char		       *name;
-	struct ibv_driver_name *next;
 };
 
 struct ibv_driver {
+	struct list_node	entry;
 	const char	       *name;
 	verbs_driver_init_func	verbs_init_func;
-	struct ibv_driver      *next;
 };
 
-static struct ibv_sysfs_dev *sysfs_dev_list;
-static struct ibv_driver_name *driver_name_list;
-static struct ibv_driver *head_driver, *tail_driver;
+static LIST_HEAD(driver_name_list);
+static LIST_HEAD(driver_list);
 
-static int find_sysfs_devs(void)
+static int find_sysfs_devs(struct list_head *tmp_sysfs_dev_list)
 {
 	char class_path[IBV_SYSFS_PATH_MAX];
 	DIR *class_dir;
@@ -140,15 +138,21 @@ static int find_sysfs_devs(void)
 			sysfs_dev->ibdev_name))
 			continue;
 
-		sysfs_dev->next        = sysfs_dev_list;
-		sysfs_dev->have_driver = 0;
+		if (stat(sysfs_dev->ibdev_path, &buf)) {
+			fprintf(stderr, PFX "Warning: couldn't stat '%s'.\n",
+				sysfs_dev->ibdev_path);
+			continue;
+		}
+
+		sysfs_dev->time_created = buf.st_mtim;
+
 		if (ibv_read_sysfs_file(sysfs_dev->sysfs_path, "abi_version",
 					value, sizeof value) > 0)
 			sysfs_dev->abi_ver = strtol(value, NULL, 10);
 		else
 			sysfs_dev->abi_ver = 0;
 
-		sysfs_dev_list = sysfs_dev;
+		list_add(tmp_sysfs_dev_list, &sysfs_dev->entry);
 		sysfs_dev      = NULL;
 	}
 
@@ -173,18 +177,9 @@ void verbs_register_driver(const char *name,
 
 	driver->name            = name;
 	driver->verbs_init_func = verbs_init_func;
-	driver->next            = NULL;
 
-	if (tail_driver)
-		tail_driver->next = driver;
-	else
-		head_driver = driver;
-	tail_driver = driver;
+	list_add_tail(&driver_list, &driver->entry);
 }
-
-#define __IBV_QUOTE(x)	#x
-#define IBV_QUOTE(x)	__IBV_QUOTE(x)
-#define DLOPEN_TRAILER "-" IBV_QUOTE(IBV_DEVICE_LIBRARY_EXTENSION) ".so"
 
 static void load_driver(const char *name)
 {
@@ -194,7 +189,7 @@ static void load_driver(const char *name)
 	/* If the name is an absolute path then open that path after appending
 	   the trailer suffix */
 	if (name[0] == '/') {
-		if (asprintf(&so_name, "%s" DLOPEN_TRAILER, name) < 0)
+		if (asprintf(&so_name, "%s" VERBS_PROVIDER_SUFFIX, name) < 0)
 			goto out_asprintf;
 		dlhandle = dlopen(so_name, RTLD_NOW);
 		if (!dlhandle)
@@ -205,8 +200,9 @@ static void load_driver(const char *name)
 
 	/* If configured with a provider plugin path then try that next */
 	if (sizeof(VERBS_PROVIDER_DIR) > 1) {
-		if (asprintf(&so_name, VERBS_PROVIDER_DIR "/lib%s" DLOPEN_TRAILER, name) <
-		    0)
+		if (asprintf(&so_name,
+			     VERBS_PROVIDER_DIR "/lib%s" VERBS_PROVIDER_SUFFIX,
+			     name) < 0)
 			goto out_asprintf;
 		dlhandle = dlopen(so_name, RTLD_NOW);
 		free(so_name);
@@ -216,7 +212,7 @@ static void load_driver(const char *name)
 
 	/* Otherwise use the system libary search path. This is the historical
 	   behavior of libibverbs */
-	if (asprintf(&so_name, "lib%s" DLOPEN_TRAILER, name) < 0)
+	if (asprintf(&so_name, "lib%s" VERBS_PROVIDER_SUFFIX, name) < 0)
 		goto out_asprintf;
 	dlhandle = dlopen(so_name, RTLD_NOW);
 	if (!dlhandle)
@@ -256,9 +252,7 @@ static void load_drivers(void)
 		}
 	}
 
-	for (name = driver_name_list, next_name = name ? name->next : NULL;
-	     name;
-	     name = next_name, next_name = name ? name->next : NULL) {
+	list_for_each_safe(&driver_name_list, name, next_name, entry) {
 		load_driver(name->name);
 		free(name->name);
 		free(name);
@@ -309,8 +303,7 @@ static void read_config_file(const char *path)
 				continue;
 			}
 
-			driver_name->next = driver_name_list;
-			driver_name_list  = driver_name;
+			list_add(&driver_name_list, &driver_name->entry);
 		} else
 			fprintf(stderr, PFX "Warning: ignoring bad config directive "
 				"'%s' in file '%s'.\n", field, path);
@@ -361,8 +354,8 @@ out:
 	closedir(conf_dir);
 }
 
-static struct ibv_device *try_driver(struct ibv_driver *driver,
-				     struct ibv_sysfs_dev *sysfs_dev)
+static struct verbs_device *try_driver(struct ibv_driver *driver,
+				       struct ibv_sysfs_dev *sysfs_dev)
 {
 	struct verbs_device *vdev;
 	struct ibv_device *dev;
@@ -372,6 +365,7 @@ static struct ibv_device *try_driver(struct ibv_driver *driver,
 	if (!vdev)
 		return NULL;
 
+	atomic_init(&vdev->refcount, 1);
 	dev = &vdev->device;
 	assert(dev->_ops._dummy1 == NULL);
 	assert(dev->_ops._dummy2 == NULL);
@@ -410,16 +404,17 @@ static struct ibv_device *try_driver(struct ibv_driver *driver,
 	strcpy(dev->dev_path,   sysfs_dev->sysfs_path);
 	strcpy(dev->name,       sysfs_dev->ibdev_name);
 	strcpy(dev->ibdev_path, sysfs_dev->ibdev_path);
+	vdev->sysfs = sysfs_dev;
 
-	return dev;
+	return vdev;
 }
 
-static struct ibv_device *try_drivers(struct ibv_sysfs_dev *sysfs_dev)
+static struct verbs_device *try_drivers(struct ibv_sysfs_dev *sysfs_dev)
 {
 	struct ibv_driver *driver;
-	struct ibv_device *dev;
+	struct verbs_device *dev;
 
-	for (driver = head_driver; driver; driver = driver->next) {
+	list_for_each(&driver_list, driver, entry) {
 		dev = try_driver(driver, sysfs_dev);
 		if (dev)
 			return dev;
@@ -468,68 +463,80 @@ static void check_memlock_limit(void)
 			rlim.rlim_cur);
 }
 
-static void add_device(struct ibv_device *dev,
-		       struct ibv_device ***dev_list,
-		       int *num_devices,
-		       int *list_size)
+static int same_sysfs_dev(struct ibv_sysfs_dev *sysfs1,
+			  struct ibv_sysfs_dev *sysfs2)
 {
-	struct ibv_device **new_list;
-
-	if (*list_size <= *num_devices) {
-		*list_size = *list_size ? *list_size * 2 : 1;
-		new_list = realloc(*dev_list, *list_size * sizeof (struct ibv_device *));
-		if (!new_list)
-			return;
-		*dev_list = new_list;
-	}
-
-	(*dev_list)[(*num_devices)++] = dev;
+	if (!strcmp(sysfs1->sysfs_name, sysfs2->sysfs_name) &&
+	    ts_cmp(&sysfs1->time_created,
+		   &sysfs2->time_created, ==))
+		return 1;
+	return 0;
 }
 
-int ibverbs_init(struct ibv_device ***list)
+/* Match every ibv_sysfs_dev in the sysfs_list to a driver and add a new entry
+ * to device_list. Once matched to a driver the entry in sysfs_list is
+ * removed.
+ */
+static void try_all_drivers(struct list_head *sysfs_list,
+			    struct list_head *device_list,
+			    unsigned int *num_devices)
 {
-	const char *sysfs_path;
+	struct ibv_sysfs_dev *sysfs_dev;
+	struct ibv_sysfs_dev *tmp;
+	struct verbs_device *vdev;
+
+	list_for_each_safe(sysfs_list, sysfs_dev, tmp, entry) {
+		vdev = try_drivers(sysfs_dev);
+		if (vdev) {
+			list_del(&sysfs_dev->entry);
+			/* Ownership of sysfs_dev moves into vdev->sysfs */
+			list_add(device_list, &vdev->entry);
+			(*num_devices)++;
+		}
+	}
+}
+
+int ibverbs_get_device_list(struct list_head *device_list)
+{
+	LIST_HEAD(sysfs_list);
 	struct ibv_sysfs_dev *sysfs_dev, *next_dev;
-	struct ibv_device *device;
-	int num_devices = 0;
-	int list_size = 0;
+	struct verbs_device *vdev, *tmp;
+	static int drivers_loaded;
+	unsigned int num_devices = 0;
 	int statically_linked = 0;
-	int no_driver = 0;
 	int ret;
 
-	*list = NULL;
-
-	if (getenv("RDMAV_FORK_SAFE") || getenv("IBV_FORK_SAFE"))
-		if (ibv_fork_init())
-			fprintf(stderr, PFX "Warning: fork()-safety requested "
-				"but init failed\n");
-
-	sysfs_path = ibv_get_sysfs_path();
-	if (!sysfs_path)
-		return -ENOSYS;
-
-	ret = check_abi_version(sysfs_path);
+	ret = find_sysfs_devs(&sysfs_list);
 	if (ret)
 		return -ret;
 
-	check_memlock_limit();
+	/* Remove entries from the sysfs_list that are already preset in the
+	 * device_list, and remove entries from the device_list that are not
+	 * present in the sysfs_list.
+	 */
+	list_for_each_safe(device_list, vdev, tmp, entry) {
+		struct ibv_sysfs_dev *old_sysfs = NULL;
 
-	read_config();
+		list_for_each(&sysfs_list, sysfs_dev, entry) {
+			if (same_sysfs_dev(vdev->sysfs, sysfs_dev)) {
+				old_sysfs = sysfs_dev;
+				break;
+			}
+		}
 
-	ret = find_sysfs_devs();
-	if (ret)
-		return -ret;
-
-	for (sysfs_dev = sysfs_dev_list; sysfs_dev; sysfs_dev = sysfs_dev->next) {
-		device = try_drivers(sysfs_dev);
-		if (device) {
-			add_device(device, list, &num_devices, &list_size);
-			sysfs_dev->have_driver = 1;
-		} else
-			no_driver = 1;
+		if (old_sysfs) {
+			list_del(&old_sysfs->entry);
+			free(old_sysfs);
+			num_devices++;
+		} else {
+			list_del(&vdev->entry);
+			ibverbs_device_put(&vdev->device);
+		}
 	}
 
-	if (!no_driver)
+	try_all_drivers(&sysfs_list, device_list, &num_devices);
+
+	if (list_empty(&sysfs_list) || drivers_loaded)
 		goto out;
 
 	/*
@@ -553,32 +560,68 @@ int ibverbs_init(struct ibv_device ***list)
 	}
 
 	load_drivers();
+	drivers_loaded = 1;
 
-	for (sysfs_dev = sysfs_dev_list; sysfs_dev; sysfs_dev = sysfs_dev->next) {
-		if (sysfs_dev->have_driver)
-			continue;
-
-		device = try_drivers(sysfs_dev);
-		if (device) {
-			add_device(device, list, &num_devices, &list_size);
-			sysfs_dev->have_driver = 1;
-		}
-	}
+	try_all_drivers(&sysfs_list, device_list, &num_devices);
 
 out:
-	for (sysfs_dev = sysfs_dev_list,
-		     next_dev = sysfs_dev ? sysfs_dev->next : NULL;
-	     sysfs_dev;
-	     sysfs_dev = next_dev, next_dev = sysfs_dev ? sysfs_dev->next : NULL) {
-		if (!sysfs_dev->have_driver && getenv("IBV_SHOW_WARNINGS")) {
-			fprintf(stderr, PFX "Warning: no userspace device-specific "
-				"driver found for %s\n", sysfs_dev->sysfs_path);
+	/* Anything left in sysfs_list was not assoicated with a
+	 * driver.
+	 */
+	list_for_each_safe(&sysfs_list, sysfs_dev, next_dev, entry) {
+		if (getenv("IBV_SHOW_WARNINGS")) {
+			fprintf(stderr, PFX
+				"Warning: no userspace device-specific driver found for %s\n",
+				sysfs_dev->sysfs_path);
 			if (statically_linked)
-				fprintf(stderr, "	When linking libibverbs statically, "
-					"driver must be statically linked too.\n");
+				fprintf(stderr,
+					"	When linking libibverbs statically, driver must be statically linked too.\n");
 		}
 		free(sysfs_dev);
 	}
 
 	return num_devices;
+}
+
+int ibverbs_init(void)
+{
+	const char *sysfs_path;
+	int ret;
+
+	if (getenv("RDMAV_FORK_SAFE") || getenv("IBV_FORK_SAFE"))
+		if (ibv_fork_init())
+			fprintf(stderr, PFX "Warning: fork()-safety requested "
+				"but init failed\n");
+
+	sysfs_path = ibv_get_sysfs_path();
+	if (!sysfs_path)
+		return -ENOSYS;
+
+	ret = check_abi_version(sysfs_path);
+	if (ret)
+		return -ret;
+
+	check_memlock_limit();
+
+	read_config();
+
+	return 0;
+}
+
+void ibverbs_device_hold(struct ibv_device *dev)
+{
+	struct verbs_device *verbs_device = verbs_get_device(dev);
+
+	atomic_fetch_add(&verbs_device->refcount, 1);
+}
+
+void ibverbs_device_put(struct ibv_device *dev)
+{
+	struct verbs_device *verbs_device = verbs_get_device(dev);
+
+	if (atomic_fetch_sub(&verbs_device->refcount, 1) == 1) {
+		free(verbs_device->sysfs);
+		if (verbs_device->ops->uninit_device)
+			verbs_device->ops->uninit_device(verbs_device);
+	}
 }

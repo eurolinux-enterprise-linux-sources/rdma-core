@@ -44,6 +44,7 @@
 #include <malloc.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <stdbool.h>
 
 #include "qelr.h"
 #include "qelr_abi.h"
@@ -59,6 +60,9 @@
 #define QELR_RQE_ELEMENT_SIZE	(sizeof(struct rdma_rq_sge))
 #define QELR_CQE_SIZE		(sizeof(union rdma_cqe))
 
+#define IS_IWARP(_dev)		(_dev->node_type == IBV_NODE_RNIC)
+#define IS_ROCE(_dev)		(_dev->node_type == IBV_NODE_CA)
+
 static void qelr_inc_sw_cons_u16(struct qelr_qp_hwq_info *info)
 {
 	info->cons = (info->cons + 1) % info->max_wr;
@@ -68,6 +72,11 @@ static void qelr_inc_sw_cons_u16(struct qelr_qp_hwq_info *info)
 static void qelr_inc_sw_prod_u16(struct qelr_qp_hwq_info *info)
 {
 	info->prod = (info->prod + 1) % info->max_wr;
+}
+
+static inline int qelr_wq_is_full(struct qelr_qp_hwq_info *info)
+{
+	return (((info->prod + 1) % info->max_wr) == info->cons);
 }
 
 int qelr_query_device(struct ibv_context *context,
@@ -344,7 +353,7 @@ static inline int qelr_create_qp_buffers_sq(struct qelr_devctx *cxt,
 	rc = qelr_chain_alloc(&qp->sq.chain, chain_size, cxt->kernel_page_size,
 			      QELR_SQE_ELEMENT_SIZE);
 	if (rc)
-		DP_ERR(cxt->dbg_fp, "create qp: failed to map SQ, got %d", rc);
+		DP_ERR(cxt->dbg_fp, "create qp: failed to map SQ chain, got %d", rc);
 
 	qp->sq.max_wr = max_send_wr;
 	qp->sq.max_sges = cxt->sges_per_send_wr;
@@ -371,7 +380,7 @@ static inline int qelr_create_qp_buffers_rq(struct qelr_devctx *cxt,
 	rc = qelr_chain_alloc(&qp->rq.chain, chain_size, cxt->kernel_page_size,
 			      QELR_RQE_ELEMENT_SIZE);
 	if (rc)
-		DP_ERR(cxt->dbg_fp, "create qp: failed to map RQ, got %d", rc);
+		DP_ERR(cxt->dbg_fp, "create qp: failed to map RQ chain, got %d", rc);
 
 	qp->rq.max_wr = max_recv_wr;
 	qp->rq.max_sges = cxt->sges_per_recv_wr;
@@ -414,7 +423,7 @@ static inline int qelr_configure_qp_sq(struct qelr_devctx *cxt,
 	qp->wqe_wr_id = calloc(qp->sq.max_wr, sizeof(*qp->wqe_wr_id));
 	if (!qp->wqe_wr_id) {
 		DP_ERR(cxt->dbg_fp,
-		       "create qp: failed shdow SQ memory allocation\n");
+		       "create qp: failed shadow SQ memory allocation\n");
 		return -ENOMEM;
 	}
 	return 0;
@@ -429,6 +438,9 @@ static inline int qelr_configure_qp_rq(struct qelr_devctx *cxt,
 	qp->rq.icid = resp->rq_icid;
 	qp->rq.db_data.data.icid = htole16(resp->rq_icid);
 	qp->rq.db = cxt->db_addr + resp->rq_db_offset;
+	qp->rq.iwarp_db2 = cxt->db_addr + resp->rq_db2_offset;
+	qp->rq.iwarp_db2_data.data.icid = htole16(qp->rq.icid);
+	qp->rq.iwarp_db2_data.data.value = htole16(DQ_TCM_IWARP_POST_RQ_CF_CMD);
 	qp->rq.prod = 0;
 
 	/* shadow RQ */
@@ -436,7 +448,7 @@ static inline int qelr_configure_qp_rq(struct qelr_devctx *cxt,
 	qp->rqe_wr_id = calloc(qp->rq.max_wr, sizeof(*qp->rqe_wr_id));
 	if (!qp->rqe_wr_id) {
 		DP_ERR(cxt->dbg_fp,
-		       "create qp: failed shdow RQ memory allocation\n");
+		       "create qp: failed shadow RQ memory allocation\n");
 		return -ENOMEM;
 	}
 
@@ -643,6 +655,12 @@ static int qelr_update_qp_state(struct qelr_qp *qp,
 	int status = 0;
 	enum qelr_qp_state new_state;
 
+	/* iWARP states are updated implicitely by driver and don't have a
+	 * real purpose in user-lib.
+	 */
+	if (IS_IWARP(qp->ibv_qp.context->device))
+		return 0;
+
 	new_state = get_qelr_qp_state(new_ib_state);
 
 	pthread_spin_lock(&qp->q_lock);
@@ -672,9 +690,11 @@ static int qelr_update_qp_state(struct qelr_qp *qp,
 			/* Update doorbell (in case post_recv was done before
 			 * move to RTR)
 			 */
-			mmio_wc_start();
-			writel(qp->rq.db_data.raw, qp->rq.db);
-			mmio_flush_writes();
+			if (IS_ROCE(qp->ibv_qp.context->device)) {
+				mmio_wc_start();
+				writel(qp->rq.db_data.raw, qp->rq.db);
+				mmio_flush_writes();
+			}
 			break;
 		case QELR_QPS_ERR:
 			break;
@@ -763,6 +783,7 @@ int qelr_modify_qp(struct ibv_qp *ibqp, struct ibv_qp_attr *attr,
 	struct ibv_modify_qp cmd = {};
 	struct qelr_qp *qp = get_qelr_qp(ibqp);
 	struct qelr_devctx *cxt = get_qelr_ctx(ibqp->context);
+	union ibv_gid sgid, *p_dgid;
 	int rc;
 
 	DP_VERBOSE(cxt->dbg_fp, QELR_MSG_QP, "QP Modify %p, attr_mask=0x%x\n",
@@ -771,14 +792,45 @@ int qelr_modify_qp(struct ibv_qp *ibqp, struct ibv_qp_attr *attr,
 	qelr_print_qp_attr(cxt, attr);
 
 	rc = ibv_cmd_modify_qp(ibqp, attr, attr_mask, &cmd, sizeof(cmd));
-
-	if (!rc && (attr_mask & IBV_QP_STATE)) {
-		DP_VERBOSE(cxt->dbg_fp, QELR_MSG_QP, "QP Modify state %d->%d\n",
-			   qp->state, attr->qp_state);
-		qelr_update_qp_state(qp, attr->qp_state);
+	if (rc) {
+		DP_ERR(cxt->dbg_fp, "QP Modify: Failed command. rc=%d\n", rc);
+		return rc;
 	}
 
-	return rc;
+	if (attr_mask & IBV_QP_STATE) {
+		rc = qelr_update_qp_state(qp, attr->qp_state);
+		DP_VERBOSE(cxt->dbg_fp, QELR_MSG_QP,
+			   "QP Modify state %d->%d, rc=%d\n", qp->state,
+			   attr->qp_state, rc);
+		if (rc) {
+			DP_ERR(cxt->dbg_fp,
+			       "QP Modify: Failed to update state. rc=%d\n",
+			       rc);
+
+			return rc;
+		}
+	}
+
+	/* EDPM must be disabled if GIDs match */
+	if (attr_mask & IBV_QP_AV) {
+		rc = ibv_query_gid(ibqp->context, attr->ah_attr.port_num,
+				   attr->ah_attr.grh.sgid_index, &sgid);
+
+		if (!rc) {
+			p_dgid = &attr->ah_attr.grh.dgid;
+			qp->edpm_disabled = !memcmp(&sgid, p_dgid,
+						    sizeof(sgid));
+			DP_VERBOSE(cxt->dbg_fp, QELR_MSG_QP,
+				   "QP Modify: %p, edpm_disabled=%d\n", qp,
+				   qp->edpm_disabled);
+		} else  {
+			DP_ERR(cxt->dbg_fp,
+			       "QP Modify: Failed querying GID. rc=%d\n",
+			       rc);
+		}
+	}
+
+	return 0;
 }
 
 int qelr_destroy_qp(struct ibv_qp *ibqp)
@@ -819,25 +871,30 @@ static int sge_data_len(struct ibv_sge *sg_list, int num_sge)
 
 static void swap_wqe_data64(uint64_t *p)
 {
+	__be64 *bep=(__be64 *)p;
 	int i;
 
 	for (i = 0; i < ROCE_WQE_ELEM_SIZE / sizeof(uint64_t); i++, p++)
-		*p = htobe64(htole64(*p));
+		*bep = htobe64(*p);
 }
 
-static inline void qelr_init_edpm_info(struct qelr_devctx *cxt,
-				       struct qelr_qp *qp,
-				       struct ibv_send_wr *wr,
-				       struct qelr_edpm *edpm,
-				       int data_size)
+static inline void qelr_init_dpm_info(struct qelr_devctx *cxt,
+				      struct qelr_qp *qp,
+				      struct ibv_send_wr *wr,
+				      struct qelr_dpm *dpm,
+				      int data_size)
 {
-	edpm->is_edpm = 0;
+	dpm->is_edpm = 0;
+
+	/* Currently dpm is not supported for iWARP */
+	if (IS_IWARP(cxt->ibv_ctx.device))
+		return;
 
 	if (qelr_chain_is_full(&qp->sq.chain) &&
-	    wr->send_flags & IBV_SEND_INLINE) {
-		memset(edpm, 0, sizeof(*edpm));
-		edpm->rdma_ext = (struct qelr_rdma_ext *)&edpm->dpm_payload;
-		edpm->is_edpm = 1;
+	    wr->send_flags & IBV_SEND_INLINE && !qp->edpm_disabled) {
+		memset(dpm, 0, sizeof(*dpm));
+		dpm->rdma_ext = (struct qelr_rdma_ext *)&dpm->payload;
+		dpm->is_edpm = 1;
 	}
 }
 
@@ -850,80 +907,61 @@ static inline void qelr_init_edpm_info(struct qelr_devctx *cxt,
 	 (opcode == QELR_IB_OPCODE_RDMA_WRITE_ONLY_WITH_IMMEDIATE))
 
 static inline void qelr_edpm_set_msg_data(struct qelr_qp *qp,
-					  struct qelr_edpm *edpm,
+					  struct qelr_dpm *dpm,
 					  uint8_t opcode,
 					  uint16_t length,
 					  uint8_t se,
 					  uint8_t comp)
 {
-	uint32_t wqe_size = length + (QELR_IS_IMM(opcode)? sizeof(uint32_t) : 0);
-	uint32_t dpm_size = wqe_size + sizeof(struct db_roce_dpm_data);
+	uint32_t wqe_size, dpm_size, params;
 
-	if (!edpm->is_edpm)
-		return;
+	params = 0;
+	wqe_size = length + (QELR_IS_IMM(opcode)? sizeof(uint32_t) : 0);
+	dpm_size = wqe_size + sizeof(struct db_roce_dpm_data);
 
-	SET_FIELD(edpm->msg.data.params.params, DB_ROCE_DPM_PARAMS_SIZE,
+	SET_FIELD(params, DB_ROCE_DPM_PARAMS_DPM_TYPE, DPM_ROCE);
+	SET_FIELD(params, DB_ROCE_DPM_PARAMS_OPCODE, opcode);
+	SET_FIELD(params, DB_ROCE_DPM_PARAMS_WQE_SIZE, wqe_size);
+	SET_FIELD(params, DB_ROCE_DPM_PARAMS_COMPLETION_FLG, comp ? 1 : 0);
+	SET_FIELD(params, DB_ROCE_DPM_PARAMS_S_FLG, se ? 1 : 0);
+	SET_FIELD(params, DB_ROCE_DPM_PARAMS_SIZE,
 		  (dpm_size + sizeof(uint64_t) - 1) / sizeof(uint64_t));
 
-	SET_FIELD(edpm->msg.data.params.params, DB_ROCE_DPM_PARAMS_DPM_TYPE,
-		  DPM_ROCE);
-
-	SET_FIELD(edpm->msg.data.params.params, DB_ROCE_DPM_PARAMS_OPCODE,
-		  opcode);
-
-	SET_FIELD(edpm->msg.data.params.params, DB_ROCE_DPM_PARAMS_WQE_SIZE,
-		  wqe_size);
-
-	SET_FIELD(edpm->msg.data.params.params,
-		  DB_ROCE_DPM_PARAMS_COMPLETION_FLG, comp ? 1 : 0);
-
-	SET_FIELD(edpm->msg.data.params.params, DB_ROCE_DPM_PARAMS_S_FLG,
-		  se ? 1 : 0);
+	dpm->msg.data.params.params = htole32(params);
 }
 
 static inline void qelr_edpm_set_inv_imm(struct qelr_qp *qp,
-					 struct qelr_edpm *edpm,
-					 uint32_t inv_key_or_imm_data)
+					 struct qelr_dpm *dpm,
+					 __be32 data)
 {
-	if (!edpm->is_edpm)
-		return;
+	memcpy(&dpm->payload[dpm->payload_offset], &data, sizeof(data));
 
-	memcpy(&edpm->dpm_payload[edpm->dpm_payload_offset],
-	       &inv_key_or_imm_data, sizeof(inv_key_or_imm_data));
-
-	edpm->dpm_payload_offset += sizeof(inv_key_or_imm_data);
-	edpm->dpm_payload_size += sizeof(inv_key_or_imm_data);
+	dpm->payload_offset += sizeof(data);
+	dpm->payload_size += sizeof(data);
 }
 
 static inline void qelr_edpm_set_rdma_ext(struct qelr_qp *qp,
-					  struct qelr_edpm *edpm,
+					  struct qelr_dpm *dpm,
 					  uint64_t remote_addr,
 					  uint32_t rkey)
 {
-	if (!edpm->is_edpm)
-		return;
-
-	edpm->rdma_ext->remote_va = htobe64(remote_addr);
-	edpm->rdma_ext->remote_key = htobe32(rkey);
-	edpm->dpm_payload_offset += sizeof(*edpm->rdma_ext);
-	edpm->dpm_payload_size += sizeof(*edpm->rdma_ext);
+	dpm->rdma_ext->remote_va = htobe64(remote_addr);
+	dpm->rdma_ext->remote_key = htobe32(rkey);
+	dpm->payload_offset += sizeof(*dpm->rdma_ext);
+	dpm->payload_size += sizeof(*dpm->rdma_ext);
 }
 
 static inline void qelr_edpm_set_payload(struct qelr_qp *qp,
-					 struct qelr_edpm *edpm, char *buf,
+					 struct qelr_dpm *dpm, char *buf,
 					 uint32_t length)
 {
-	if (!edpm->is_edpm)
-		return;
+	memcpy(&dpm->payload[dpm->payload_offset], buf, length);
 
-	memcpy(&edpm->dpm_payload[edpm->dpm_payload_offset], buf,
-	       length);
-
-	edpm->dpm_payload_offset += length;
+	dpm->payload_offset += length;
 }
 
 static void qelr_prepare_sq_inline_data(struct qelr_qp *qp,
-					    struct qelr_edpm *edpm,
+					    struct qelr_dpm *dpm,
 					    int data_size,
 					    uint8_t *wqe_size,
 					    struct ibv_send_wr *wr,
@@ -948,7 +986,8 @@ static void qelr_prepare_sq_inline_data(struct qelr_qp *qp,
 		uint32_t len = wr->sg_list[i].length;
 		void *src = (void *)(uintptr_t)wr->sg_list[i].addr;
 
-		qelr_edpm_set_payload(qp, edpm, src, wr->sg_list[i].length);
+		if (dpm->is_edpm)
+			qelr_edpm_set_payload(qp, dpm, src, len);
 
 		while (len > 0) {
 			uint32_t cur;
@@ -983,16 +1022,17 @@ static void qelr_prepare_sq_inline_data(struct qelr_qp *qp,
 	if (seg_siz)
 		swap_wqe_data64((uint64_t *)wqe);
 
-	if (edpm->is_edpm) {
-		edpm->dpm_payload_size += data_size;
+	if (dpm->is_edpm) {
+		dpm->payload_size += data_size;
 
 		if (wr->opcode == IBV_WR_RDMA_WRITE ||
 		    wr->opcode == IBV_WR_RDMA_WRITE_WITH_IMM)
-			edpm->rdma_ext->dma_length = htobe32(data_size);
+			dpm->rdma_ext->dma_length = htobe32(data_size);
 	}
 }
 
 static void qelr_prepare_sq_sges(struct qelr_qp *qp,
+				 struct qelr_dpm *dpm,
 				     uint8_t *wqe_size,
 				     struct ibv_send_wr *wr)
 {
@@ -1010,16 +1050,22 @@ static void qelr_prepare_sq_sges(struct qelr_qp *qp,
 		*wqe_size += wr->num_sge;
 }
 
-static void qelr_prepare_sq_rdma_data(struct qelr_qp *qp,
-				      struct qelr_edpm *edpm,
-				      int data_size,
-				      struct rdma_sq_rdma_wqe_1st *rwqe,
-				      struct rdma_sq_rdma_wqe_2nd *rwqe2,
-				      struct ibv_send_wr *wr)
+static uint32_t qelr_prepare_sq_rdma_data(struct qelr_qp *qp,
+					  struct qelr_dpm *dpm,
+					  int data_size,
+					  uint8_t *p_wqe_size,
+					  struct rdma_sq_rdma_wqe_1st *rwqe,
+					  struct rdma_sq_rdma_wqe_2nd *rwqe2,
+					  struct ibv_send_wr *wr,
+					  bool is_imm)
 {
 	memset(rwqe2, 0, sizeof(*rwqe2));
 	rwqe2->r_key = htole32(wr->wr.rdma.rkey);
 	TYPEPTR_ADDR_SET(rwqe2, remote_va, wr->wr.rdma.remote_addr);
+	rwqe->length = htole32(data_size);
+
+	if (is_imm)
+		rwqe->imm_data = htole32(be32toh(wr->imm_data));
 
 	if (wr->send_flags & IBV_SEND_INLINE &&
 	    (wr->opcode == IBV_WR_RDMA_WRITE_WITH_IMM ||
@@ -1027,35 +1073,47 @@ static void qelr_prepare_sq_rdma_data(struct qelr_qp *qp,
 		uint8_t flags = 0;
 
 		SET_FIELD2(flags, RDMA_SQ_RDMA_WQE_1ST_INLINE_FLG, 1);
-		qelr_prepare_sq_inline_data(qp, edpm, data_size,
-					    &rwqe->wqe_size, wr,
+		qelr_prepare_sq_inline_data(qp, dpm, data_size,
+					    p_wqe_size, wr,
 					    &rwqe->flags, flags);
+		rwqe->wqe_size = *p_wqe_size;
 	} else {
-		qelr_prepare_sq_sges(qp, &rwqe->wqe_size, wr);
+		qelr_prepare_sq_sges(qp, dpm, p_wqe_size, wr);
+		rwqe->wqe_size = *p_wqe_size;
 	}
-	rwqe->length = htole32(data_size);
+
+	return data_size;
 }
 
-static void qelr_prepare_sq_send_data(struct qelr_qp *qp,
-				      struct qelr_edpm *edpm,
-				      int data_size,
-				      struct rdma_sq_send_wqe_1st *swqe,
-				      struct rdma_sq_send_wqe_2st *swqe2,
-				      struct ibv_send_wr *wr)
+static uint32_t qelr_prepare_sq_send_data(struct qelr_qp *qp,
+					  struct qelr_dpm *dpm,
+					  int data_size,
+					  uint8_t *p_wqe_size,
+					  struct rdma_sq_send_wqe_1st *swqe,
+					  struct rdma_sq_send_wqe_2st *swqe2,
+					  struct ibv_send_wr *wr,
+					  bool is_imm)
 {
 	memset(swqe2, 0, sizeof(*swqe2));
+	swqe->length = htole32(data_size);
+
+	if (is_imm)
+		swqe->inv_key_or_imm_data = htole32(be32toh(wr->imm_data));
+
 	if (wr->send_flags & IBV_SEND_INLINE) {
 		uint8_t flags = 0;
 
 		SET_FIELD2(flags, RDMA_SQ_SEND_WQE_INLINE_FLG, 1);
-		qelr_prepare_sq_inline_data(qp, edpm, data_size,
-					    &swqe->wqe_size, wr,
+		qelr_prepare_sq_inline_data(qp, dpm, data_size,
+					    p_wqe_size, wr,
 					    &swqe->flags, flags);
+		swqe->wqe_size = *p_wqe_size;
 	} else {
-		qelr_prepare_sq_sges(qp, &swqe->wqe_size, wr);
+		qelr_prepare_sq_sges(qp, dpm, p_wqe_size, wr);
+		swqe->wqe_size = *p_wqe_size;
 	}
 
-	swqe->length = htole32(data_size);
+	return data_size;
 }
 
 static enum ibv_wc_opcode qelr_ibv_to_wc_opcode(enum ibv_wr_opcode opcode)
@@ -1085,12 +1143,12 @@ static inline void doorbell_qp(struct qelr_qp *qp)
 	mmio_flush_writes();
 }
 
-static inline void doorbell_edpm_qp(struct qelr_devctx *cxt, struct qelr_qp *qp,
-				    struct qelr_edpm *edpm)
+static inline void doorbell_dpm_qp(struct qelr_devctx *cxt, struct qelr_qp *qp,
+				   struct qelr_dpm *dpm)
 {
 	uint32_t offset = 0;
 	uint64_t data;
-	uint64_t *dpm_payload = (uint64_t *)edpm->dpm_payload;
+	uint64_t *payload = (uint64_t *)dpm->payload;
 	uint32_t num_dwords;
 	int bytes = 0;
 	void *db_addr;
@@ -1098,20 +1156,20 @@ static inline void doorbell_edpm_qp(struct qelr_devctx *cxt, struct qelr_qp *qp,
 	mmio_wc_start();
 
 	/* Write message header */
-	edpm->msg.data.icid = qp->sq.db_data.data.icid;
-	edpm->msg.data.prod_val = qp->sq.db_data.data.value;
+	dpm->msg.data.icid = qp->sq.db_data.data.icid;
+	dpm->msg.data.prod_val = qp->sq.db_data.data.value;
 	db_addr = qp->sq.edpm_db;
-	writeq(edpm->msg.raw, db_addr);
+	writeq(dpm->msg.raw, db_addr);
 
 
 	/* Write mesage body */
 	bytes += sizeof(uint64_t);
-	num_dwords = (edpm->dpm_payload_size + sizeof(uint64_t) - 1) /
+	num_dwords = (dpm->payload_size + sizeof(uint64_t) - 1) /
 		sizeof(uint64_t);
-	db_addr += sizeof(edpm->msg.data);
+	db_addr += sizeof(dpm->msg.data);
 
 	while (offset < num_dwords) {
-		data = dpm_payload[offset];
+		data = payload[offset];
 		writeq(data, db_addr);
 
 		bytes += sizeof(uint64_t);
@@ -1144,6 +1202,14 @@ static inline int qelr_can_post_send(struct qelr_devctx *cxt,
 		return -EINVAL;
 	}
 
+	/* WR overflow */
+	if (qelr_wq_is_full(&qp->sq)) {
+		DP_ERR(cxt->dbg_fp,
+		       "error: WQ is full. Post send on QP %p failed (this error appears only once)\n",
+		       qp);
+		return -ENOMEM;
+	}
+
 	/* WQE overflow */
 	if (qelr_chain_get_elem_left_u32(&qp->sq.chain) <
 			QELR_MAX_SQ_WQE_SIZE) {
@@ -1172,7 +1238,7 @@ static inline int qelr_can_post_send(struct qelr_devctx *cxt,
 
 static int __qelr_post_send(struct qelr_devctx *cxt, struct qelr_qp *qp,
 			    struct ibv_send_wr *wr, int data_size,
-			    int *doorbell_required)
+			    int *normal_db_required)
 {
 	uint8_t se, comp, fence;
 	struct rdma_sq_common_wqe *wqe;
@@ -1183,11 +1249,13 @@ static int __qelr_post_send(struct qelr_devctx *cxt, struct qelr_qp *qp,
 	struct rdma_sq_atomic_wqe_1st *awqe1;
 	struct rdma_sq_atomic_wqe_2nd *awqe2;
 	struct rdma_sq_atomic_wqe_3rd *awqe3;
-	struct qelr_edpm edpm;
+	struct qelr_dpm dpm;
+	uint32_t wqe_length;
+	uint8_t wqe_size;
 	uint16_t db_val;
 	int rc = 0;
 
-	qelr_init_edpm_info(cxt, qp, wr, &edpm, data_size);
+	qelr_init_dpm_info(cxt, qp, wr, &dpm, data_size);
 
 	wqe = qelr_chain_produce(&qp->sq.chain);
 
@@ -1211,81 +1279,105 @@ static int __qelr_post_send(struct qelr_devctx *cxt, struct qelr_qp *qp,
 		wqe->req_type = RDMA_SQ_REQ_TYPE_SEND_WITH_IMM;
 		swqe = (struct rdma_sq_send_wqe_1st *)wqe;
 
-		swqe->wqe_size = 2;
+		wqe_size = sizeof(struct rdma_sq_send_wqe) / RDMA_WQE_BYTES;
 		swqe2 = (struct rdma_sq_send_wqe_2st *)qelr_chain_produce(&qp->sq.chain);
-		swqe->inv_key_or_imm_data = htobe32(htole32(wr->imm_data));
-		qelr_edpm_set_inv_imm(qp, &edpm, swqe->inv_key_or_imm_data);
-		qelr_prepare_sq_send_data(qp, &edpm, data_size, swqe, swqe2, wr);
-		qelr_edpm_set_msg_data(qp, &edpm,
-				       QELR_IB_OPCODE_SEND_ONLY_WITH_IMMEDIATE,
-				       swqe->length, se, comp);
-		qp->wqe_wr_id[qp->sq.prod].wqe_size = swqe->wqe_size;
-		qp->prev_wqe_size = swqe->wqe_size;
-		qp->wqe_wr_id[qp->sq.prod].bytes_len = swqe->length;
+
+		if (dpm.is_edpm)
+			qelr_edpm_set_inv_imm(qp, &dpm, wr->imm_data);
+
+		wqe_length = qelr_prepare_sq_send_data(qp, &dpm, data_size,
+						       &wqe_size, swqe, swqe2,
+						       wr, 1 /* Imm */);
+
+		if (dpm.is_edpm)
+			qelr_edpm_set_msg_data(qp, &dpm,
+					       QELR_IB_OPCODE_SEND_ONLY_WITH_IMMEDIATE,
+					       wqe_length, se, comp);
+
+		qp->wqe_wr_id[qp->sq.prod].wqe_size = wqe_size;
+		qp->prev_wqe_size = wqe_size;
+		qp->wqe_wr_id[qp->sq.prod].bytes_len = wqe_length;
 		break;
 
 	case IBV_WR_SEND:
 		wqe->req_type = RDMA_SQ_REQ_TYPE_SEND;
 		swqe = (struct rdma_sq_send_wqe_1st *)wqe;
 
-		swqe->wqe_size = 2;
+		wqe_size = sizeof(struct rdma_sq_send_wqe) / RDMA_WQE_BYTES;
 		swqe2 = (struct rdma_sq_send_wqe_2st *)qelr_chain_produce(&qp->sq.chain);
-		qelr_prepare_sq_send_data(qp, &edpm, data_size, swqe, swqe2, wr);
-		qelr_edpm_set_msg_data(qp, &edpm, QELR_IB_OPCODE_SEND_ONLY,
-				       swqe->length, se, comp);
-		qp->wqe_wr_id[qp->sq.prod].wqe_size = swqe->wqe_size;
-		qp->prev_wqe_size = swqe->wqe_size;
-		qp->wqe_wr_id[qp->sq.prod].bytes_len = swqe->length;
+		wqe_length = qelr_prepare_sq_send_data(qp, &dpm, data_size,
+						       &wqe_size, swqe, swqe2,
+						       wr, 0);
+
+		if (dpm.is_edpm)
+			qelr_edpm_set_msg_data(qp, &dpm,
+					       QELR_IB_OPCODE_SEND_ONLY,
+					       wqe_length, se, comp);
+
+		qp->wqe_wr_id[qp->sq.prod].wqe_size = wqe_size;
+		qp->prev_wqe_size = wqe_size;
+		qp->wqe_wr_id[qp->sq.prod].bytes_len = wqe_length;
 		break;
 
 	case IBV_WR_RDMA_WRITE_WITH_IMM:
 		wqe->req_type = RDMA_SQ_REQ_TYPE_RDMA_WR_WITH_IMM;
 		rwqe = (struct rdma_sq_rdma_wqe_1st *)wqe;
 
-		rwqe->wqe_size = 2;
-		rwqe->imm_data = htobe32(htole32(wr->imm_data));
-		qelr_edpm_set_rdma_ext(qp, &edpm, wr->wr.rdma.remote_addr,
-				       wr->wr.rdma.rkey);
-		qelr_edpm_set_inv_imm(qp, &edpm, rwqe->imm_data);
+		wqe_size = sizeof(struct rdma_sq_rdma_wqe) / RDMA_WQE_BYTES;
 		rwqe2 = (struct rdma_sq_rdma_wqe_2nd *)qelr_chain_produce(&qp->sq.chain);
-		qelr_prepare_sq_rdma_data(qp, &edpm, data_size, rwqe, rwqe2, wr);
-		qelr_edpm_set_msg_data(qp, &edpm,
-				       QELR_IB_OPCODE_RDMA_WRITE_ONLY_WITH_IMMEDIATE,
-				       rwqe->length + sizeof(*edpm.rdma_ext),
-				       se, comp);
-		qp->wqe_wr_id[qp->sq.prod].wqe_size = rwqe->wqe_size;
-		qp->prev_wqe_size = rwqe->wqe_size;
-		qp->wqe_wr_id[qp->sq.prod].bytes_len = rwqe->length;
+		if (dpm.is_edpm) {
+			qelr_edpm_set_rdma_ext(qp, &dpm, wr->wr.rdma.remote_addr,
+					       wr->wr.rdma.rkey);
+			qelr_edpm_set_inv_imm(qp, &dpm, wr->imm_data);
+		}
+
+		wqe_length = qelr_prepare_sq_rdma_data(qp, &dpm, data_size, &wqe_size,
+						       rwqe, rwqe2, wr, 1 /* Imm */);
+		if (dpm.is_edpm)
+			qelr_edpm_set_msg_data(qp, &dpm,
+					       QELR_IB_OPCODE_RDMA_WRITE_ONLY_WITH_IMMEDIATE,
+					       wqe_length + sizeof(*dpm.rdma_ext),
+					       se, comp);
+		qp->wqe_wr_id[qp->sq.prod].wqe_size = wqe_size;
+		qp->prev_wqe_size = wqe_size;
+		qp->wqe_wr_id[qp->sq.prod].bytes_len = wqe_length;
 		break;
 
 	case IBV_WR_RDMA_WRITE:
 		wqe->req_type = RDMA_SQ_REQ_TYPE_RDMA_WR;
 		rwqe = (struct rdma_sq_rdma_wqe_1st *)wqe;
 
-		rwqe->wqe_size = 2;
-		qelr_edpm_set_rdma_ext(qp, &edpm, wr->wr.rdma.remote_addr,
-				       wr->wr.rdma.rkey);
+		wqe_size = sizeof(struct rdma_sq_rdma_wqe) / RDMA_WQE_BYTES;
 		rwqe2 = (struct rdma_sq_rdma_wqe_2nd *)qelr_chain_produce(&qp->sq.chain);
-		qelr_prepare_sq_rdma_data(qp, &edpm, data_size, rwqe, rwqe2, wr);
-		qelr_edpm_set_msg_data(qp, &edpm,
-				       QELR_IB_OPCODE_RDMA_WRITE_ONLY,
-				       rwqe->length + sizeof(*edpm.rdma_ext),
-				       se, comp);
-		qp->wqe_wr_id[qp->sq.prod].wqe_size = rwqe->wqe_size;
-		qp->prev_wqe_size = rwqe->wqe_size;
-		qp->wqe_wr_id[qp->sq.prod].bytes_len = rwqe->length;
+		if (dpm.is_edpm)
+			qelr_edpm_set_rdma_ext(qp, &dpm,
+					       wr->wr.rdma.remote_addr,
+					       wr->wr.rdma.rkey);
+
+		wqe_length = qelr_prepare_sq_rdma_data(qp, &dpm, data_size, &wqe_size,
+						       rwqe, rwqe2, wr, 0);
+		if (dpm.is_edpm)
+			qelr_edpm_set_msg_data(qp, &dpm,
+					       QELR_IB_OPCODE_RDMA_WRITE_ONLY,
+					       wqe_length +
+					       sizeof(*dpm.rdma_ext),
+					       se, comp);
+		qp->wqe_wr_id[qp->sq.prod].wqe_size = wqe_size;
+		qp->prev_wqe_size = wqe_size;
+		qp->wqe_wr_id[qp->sq.prod].bytes_len = wqe_length;
 		break;
 
 	case IBV_WR_RDMA_READ:
 		wqe->req_type = RDMA_SQ_REQ_TYPE_RDMA_RD;
 		rwqe = (struct rdma_sq_rdma_wqe_1st *)wqe;
 
-		rwqe->wqe_size = 2;
+		wqe_size = sizeof(struct rdma_sq_rdma_wqe) / RDMA_WQE_BYTES;
 		rwqe2 = (struct rdma_sq_rdma_wqe_2nd *)qelr_chain_produce(&qp->sq.chain);
-		qelr_prepare_sq_rdma_data(qp, &edpm, data_size, rwqe, rwqe2, wr);
-		qp->wqe_wr_id[qp->sq.prod].wqe_size = rwqe->wqe_size;
-		qp->prev_wqe_size = rwqe->wqe_size;
-		qp->wqe_wr_id[qp->sq.prod].bytes_len = rwqe->length;
+		wqe_length = qelr_prepare_sq_rdma_data(qp, &dpm, data_size, &wqe_size,
+						       rwqe, rwqe2, wr, 0);
+		qp->wqe_wr_id[qp->sq.prod].wqe_size = wqe_size;
+		qp->prev_wqe_size = wqe_size;
+		qp->wqe_wr_id[qp->sq.prod].bytes_len = wqe_length;
 		break;
 
 	case IBV_WR_ATOMIC_CMP_AND_SWP:
@@ -1308,7 +1400,7 @@ static int __qelr_post_send(struct qelr_devctx *cxt, struct qelr_qp *qp,
 			TYPEPTR_ADDR_SET(awqe3, cmp_data, wr->wr.atomic.compare_add);
 		}
 
-		qelr_prepare_sq_sges(qp, NULL, wr);
+		qelr_prepare_sq_sges(qp, &dpm, NULL, wr);
 
 		qp->wqe_wr_id[qp->sq.prod].wqe_size = awqe1->wqe_size;
 		qp->prev_wqe_size = awqe1->wqe_size;
@@ -1339,11 +1431,11 @@ static int __qelr_post_send(struct qelr_devctx *cxt, struct qelr_qp *qp,
 	db_val = le16toh(qp->sq.db_data.data.value) + 1;
 	qp->sq.db_data.data.value = htole16(db_val);
 
-	if (edpm.is_edpm) {
-		doorbell_edpm_qp(cxt, qp, &edpm);
-		*doorbell_required = 0;
+	if (dpm.is_edpm) {
+		doorbell_dpm_qp(cxt, qp, &dpm);
+		*normal_db_required = 0;
 	} else {
-		*doorbell_required = 1;
+		*normal_db_required = 1;
 	}
 
 	return 0;
@@ -1360,7 +1452,8 @@ int qelr_post_send(struct ibv_qp *ib_qp, struct ibv_send_wr *wr,
 
 	pthread_spin_lock(&qp->q_lock);
 
-	if ((qp->state != QELR_QPS_RTS && qp->state != QELR_QPS_ERR &&
+	if (IS_ROCE(ib_qp->context->device) &&
+	    (qp->state != QELR_QPS_RTS && qp->state != QELR_QPS_ERR &&
 	     qp->state != QELR_QPS_SQD)) {
 		pthread_spin_unlock(&qp->q_lock);
 		*bad_wr = wr;
@@ -1400,10 +1493,11 @@ int qelr_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 	struct qelr_qp *qp =  get_qelr_qp(ibqp);
 	struct qelr_devctx *cxt = get_qelr_ctx(ibqp->context);
 	uint16_t db_val;
+	uint8_t iwarp = IS_IWARP(ibqp->context->device);
 
 	pthread_spin_lock(&qp->q_lock);
 
-	if (qp->state == QELR_QPS_RST) {
+	if (!iwarp && qp->state == QELR_QPS_RST) {
 		pthread_spin_unlock(&qp->q_lock);
 		*bad_wr = wr;
 		return -EINVAL;
@@ -1472,6 +1566,10 @@ int qelr_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 		writel(qp->rq.db_data.raw, qp->rq.db);
 		mmio_flush_writes();
 
+		if (iwarp) {
+			writel(qp->rq.iwarp_db2_data.raw, qp->rq.iwarp_db2);
+			mmio_flush_writes();
+		}
 		wr = wr->next;
 	}
 
@@ -1499,7 +1597,7 @@ static struct qelr_qp *cqe_get_qp(union rdma_cqe *cqe)
 {
 	struct regpair *qph = &cqe->req.qp_handle;
 
-	return (struct qelr_qp *)HILO_U64(qph->hi, qph->lo);
+	return (struct qelr_qp *)HILO_U64(le32toh(qph->hi), le32toh(qph->lo));
 }
 
 static int process_req(struct qelr_qp *qp, struct qelr_cq *cq, int num_entries,
@@ -1538,6 +1636,7 @@ static int process_req(struct qelr_qp *qp, struct qelr_cq *cq, int num_entries,
 		case IBV_WC_RDMA_READ:
 		case IBV_WC_SEND:
 		case IBV_WC_BIND_MW:
+			wc->byte_len = qp->wqe_wr_id[qp->sq.cons].bytes_len;
 			DP_VERBOSE(cxt->dbg_fp, QELR_MSG_CQ,
 				   "POLL REQ CQ: IBV_WC_RDMA_READ / IBV_WC_SEND\n");
 			break;
@@ -1562,24 +1661,25 @@ static int qelr_poll_cq_req(struct qelr_qp *qp, struct qelr_cq *cq,
 			    struct rdma_cqe_requester *req)
 {
 	struct qelr_devctx *cxt = get_qelr_ctx(qp->ibv_qp.context);
+	uint16_t sq_cons = le16toh(req->sq_cons);
 	int cnt = 0;
 
 	switch (req->status) {
 	case RDMA_CQE_REQ_STS_OK:
-		cnt = process_req(qp, cq, num_entries, wc, req->sq_cons,
+		cnt = process_req(qp, cq, num_entries, wc, sq_cons,
 				  IBV_WC_SUCCESS, 0);
 		break;
 	case RDMA_CQE_REQ_STS_WORK_REQUEST_FLUSHED_ERR:
 		DP_ERR(cxt->dbg_fp,
 		       "Error: POLL CQ with ROCE_CQE_REQ_STS_WORK_REQUEST_FLUSHED_ERR. QP icid=0x%x\n",
 		       qp->sq.icid);
-		cnt = process_req(qp, cq, num_entries, wc, req->sq_cons,
+		cnt = process_req(qp, cq, num_entries, wc, sq_cons,
 				  IBV_WC_WR_FLUSH_ERR, 0);
 		break;
 	default: /* other errors case */
 		/* process all WQE before the consumer */
 		qp->state = QELR_QPS_ERR;
-		cnt = process_req(qp, cq, num_entries, wc, req->sq_cons - 1,
+		cnt = process_req(qp, cq, num_entries, wc, sq_cons - 1,
 				  IBV_WC_SUCCESS, 0);
 		wc += cnt;
 		/* if we have extra WC fill it with actual error info */
@@ -1587,13 +1687,13 @@ static int qelr_poll_cq_req(struct qelr_qp *qp, struct qelr_cq *cq,
 			enum ibv_wc_status wc_status;
 
 			switch (req->status) {
-			case	RDMA_CQE_REQ_STS_BAD_RESPONSE_ERR:
+			case    RDMA_CQE_REQ_STS_BAD_RESPONSE_ERR:
 				DP_ERR(cxt->dbg_fp,
 				       "Error: POLL CQ with RDMA_CQE_REQ_STS_BAD_RESPONSE_ERR. QP icid=0x%x\n",
 				       qp->sq.icid);
 				wc_status = IBV_WC_BAD_RESP_ERR;
 				break;
-			case	RDMA_CQE_REQ_STS_LOCAL_LENGTH_ERR:
+			case    RDMA_CQE_REQ_STS_LOCAL_LENGTH_ERR:
 				DP_ERR(cxt->dbg_fp,
 				       "Error: POLL CQ with RDMA_CQE_REQ_STS_LOCAL_LENGTH_ERR. QP icid=0x%x\n",
 				       qp->sq.icid);
@@ -1650,12 +1750,12 @@ static int qelr_poll_cq_req(struct qelr_qp *qp, struct qelr_cq *cq,
 			default:
 				DP_ERR(cxt->dbg_fp,
 				       "IBV_WC_GENERAL_ERR. QP icid=0x%x\n",
-					qp->sq.icid);
+				       qp->sq.icid);
 				wc_status = IBV_WC_GENERAL_ERR;
 			}
 
-			cnt += process_req(qp, cq, 1, wc, req->sq_cons,
-					   wc_status, 1 /* force use of WC */);
+			cnt += process_req(qp, cq, 1, wc, sq_cons, wc_status,
+					   1 /* force use of WC */);
 		}
 	}
 
@@ -1704,8 +1804,7 @@ static void __process_resp_one(struct qelr_qp *qp, struct qelr_cq *cq,
 			wc->opcode = IBV_WC_RECV_RDMA_WITH_IMM;
 			SWITCH_FALLTHROUGH;
 		case QELR_RESP_IMM:
-			wc->imm_data =
-				be32toh(le32toh(resp->imm_data_or_inv_r_Key));
+			wc->imm_data = htobe32(le32toh(resp->imm_data_or_inv_r_Key));
 			wc->wc_flags |= IBV_WC_WITH_IMM;
 			break;
 		case QELR_RESP_RDMA:
@@ -1775,7 +1874,9 @@ static union rdma_cqe *get_cqe(struct qelr_cq *cq)
 static void try_consume_req_cqe(struct qelr_cq *cq, struct qelr_qp *qp,
 				struct rdma_cqe_requester *req, int *update)
 {
-	if (le16toh(req->sq_cons) == qp->sq.wqe_cons) {
+	uint16_t sq_cons = le16toh(req->sq_cons);
+
+	if (sq_cons == qp->sq.wqe_cons) {
 		consume_cqe(cq);
 		*update |= 1;
 	}
@@ -1783,9 +1884,9 @@ static void try_consume_req_cqe(struct qelr_cq *cq, struct qelr_qp *qp,
 
 /* used with flush only, when resp->rq_cons is valid */
 static void try_consume_resp_cqe(struct qelr_cq *cq, struct qelr_qp *qp,
-				 struct rdma_cqe_responder *resp, int *update)
+				 uint16_t rq_cons, int *update)
 {
-	if (le16toh(resp->rq_cons) == qp->rq.wqe_cons) {
+	if (rq_cons == qp->rq.wqe_cons) {
 		consume_cqe(cq);
 		*update |= 1;
 	}
@@ -1795,12 +1896,12 @@ static int qelr_poll_cq_resp(struct qelr_qp *qp, struct qelr_cq *cq,
 			     int num_entries, struct ibv_wc *wc,
 			     struct rdma_cqe_responder *resp, int *update)
 {
+	uint16_t rq_cons = le16toh(resp->rq_cons);
 	int cnt;
 
 	if (resp->status == RDMA_CQE_RESP_STS_WORK_REQUEST_FLUSHED_ERR) {
-		cnt = process_resp_flush(qp, cq, num_entries, wc,
-					 resp->rq_cons);
-		try_consume_resp_cqe(cq, qp, resp, update);
+		cnt = process_resp_flush(qp, cq, num_entries, wc, rq_cons);
+		try_consume_resp_cqe(cq, qp, rq_cons, update);
 	} else {
 		cnt = process_resp_one(qp, cq, wc, resp);
 		consume_cqe(cq);

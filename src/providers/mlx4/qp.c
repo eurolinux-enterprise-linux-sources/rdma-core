@@ -38,11 +38,10 @@
 #include <pthread.h>
 #include <string.h>
 #include <errno.h>
+#include <util/mmio.h>
 #include <util/compiler.h>
 
 #include "mlx4.h"
-#include "doorbell.h"
-#include "wqe.h"
 
 static const uint32_t mlx4_ib_opcode[] = {
 	[IBV_WR_SEND]			= MLX4_OPCODE_SEND,
@@ -176,7 +175,7 @@ static void set_atomic_seg(struct mlx4_wqe_atomic_seg *aseg, struct ibv_send_wr 
 static void set_datagram_seg(struct mlx4_wqe_datagram_seg *dseg,
 			     struct ibv_send_wr *wr)
 {
-	memcpy(dseg->av, &to_mah(wr->wr.ud.ah)->av, sizeof (struct mlx4_av));
+	memcpy(&dseg->av, &to_mah(wr->wr.ud.ah)->av, sizeof (struct mlx4_av));
 	dseg->dqpn = htobe32(wr->wr.ud.remote_qpn);
 	dseg->qkey = htobe32(wr->wr.ud.remote_qkey);
 	dseg->vlan = htobe16(to_mah(wr->wr.ud.ah)->vlan);
@@ -305,7 +304,7 @@ int mlx4_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			case IBV_WR_LOCAL_INV:
 				ctrl->srcrb_flags |=
 					htobe32(MLX4_WQE_CTRL_STRONG_ORDER);
-				set_local_inv_seg(wqe, wr->imm_data);
+				set_local_inv_seg(wqe, wr->invalidate_rkey);
 				wqe  += sizeof
 					(struct mlx4_wqe_local_inval_seg);
 				size += sizeof
@@ -321,7 +320,7 @@ int mlx4_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					(struct mlx4_wqe_bind_seg) / 16;
 				break;
 			case IBV_WR_SEND_WITH_INV:
-				ctrl->imm = htobe32(wr->imm_data);
+				ctrl->imm = htobe32(wr->invalidate_rkey);
 				break;
 
 			default:
@@ -480,8 +479,8 @@ out:
 		 */
 		mmio_wc_spinlock(&ctx->bf_lock);
 
-		mlx4_bf_copy(ctx->bf_page + ctx->bf_offset, (unsigned long *) ctrl,
-			     align(size * 16, 64));
+		mmio_memcpy_x64(ctx->bf_page + ctx->bf_offset, ctrl,
+				align(size * 16, 64));
 		/* Flush before toggling bf_offset to be latency oriented */
 		mmio_flush_writes();
 
@@ -497,8 +496,8 @@ out:
 		 */
 		udma_to_device_barrier();
 
-		mmio_writel((unsigned long)(ctx->uar + MLX4_SEND_DOORBELL),
-			    qp->doorbell_qpn);
+		mmio_write32_be(ctx->uar + MLX4_SEND_DOORBELL,
+				qp->doorbell_qpn);
 	}
 
 	if (nreq)
@@ -510,10 +509,14 @@ out:
 	return ret;
 }
 
-int mlx4_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
-		   struct ibv_recv_wr **bad_wr)
+static inline int _mlx4_post_recv(struct mlx4_qp *qp, struct mlx4_cq *cq,
+				  struct ibv_recv_wr *wr,
+				  struct ibv_recv_wr **bad_wr)
+				  ALWAYS_INLINE;
+static inline int _mlx4_post_recv(struct mlx4_qp *qp, struct mlx4_cq *cq,
+				  struct ibv_recv_wr *wr,
+				  struct ibv_recv_wr **bad_wr)
 {
-	struct mlx4_qp *qp = to_mqp(ibqp);
 	struct mlx4_wqe_data_seg *scat;
 	int ret = 0;
 	int nreq;
@@ -527,7 +530,7 @@ int mlx4_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 	ind = qp->rq.head & (qp->rq.wqe_cnt - 1);
 
 	for (nreq = 0; wr; ++nreq, wr = wr->next) {
-		if (wq_overflow(&qp->rq, nreq, to_mcq(ibqp->recv_cq))) {
+		if (wq_overflow(&qp->rq, nreq, cq)) {
 			ret = ENOMEM;
 			*bad_wr = wr;
 			goto out;
@@ -571,6 +574,24 @@ out:
 	pthread_spin_unlock(&qp->rq.lock);
 
 	return ret;
+}
+
+int mlx4_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
+		   struct ibv_recv_wr **bad_wr)
+{
+	struct mlx4_qp *qp = to_mqp(ibqp);
+	struct mlx4_cq *cq = to_mcq(ibqp->recv_cq);
+
+	return _mlx4_post_recv(qp, cq, wr, bad_wr);
+}
+
+int mlx4_post_wq_recv(struct ibv_wq *ibwq, struct ibv_recv_wr *wr,
+		      struct ibv_recv_wr **bad_wr)
+{
+	struct mlx4_qp *qp = wq_to_mqp(ibwq);
+	struct mlx4_cq *cq = to_mcq(ibwq->cq);
+
+	return _mlx4_post_recv(qp, cq, wr, bad_wr);
 }
 
 static int num_inline_segs(int data, enum ibv_qp_type type)
@@ -651,10 +672,18 @@ void mlx4_calc_sq_wqe_size(struct ibv_qp_cap *cap, enum ibv_qp_type type,
 		; /* nothing */
 }
 
-int mlx4_alloc_qp_buf(struct ibv_context *context, struct ibv_qp_cap *cap,
-		       enum ibv_qp_type type, struct mlx4_qp *qp)
+int mlx4_alloc_qp_buf(struct ibv_context *context, uint32_t max_recv_sge,
+		      enum ibv_qp_type type, struct mlx4_qp *qp,
+		      struct mlx4dv_qp_init_attr *mlx4qp_attr)
 {
-	qp->rq.max_gs	 = cap->max_recv_sge;
+	int wqe_size;
+
+	qp->rq.max_gs	 = max_recv_sge;
+	wqe_size = qp->rq.max_gs * sizeof(struct mlx4_wqe_data_seg);
+	if (mlx4qp_attr &&
+	    mlx4qp_attr->comp_mask & MLX4DV_QP_INIT_ATTR_MASK_INL_RECV &&
+	    mlx4qp_attr->inl_recv_sz > wqe_size)
+		wqe_size = mlx4qp_attr->inl_recv_sz;
 
 	if (qp->sq.wqe_cnt) {
 		qp->sq.wrid = malloc(qp->sq.wqe_cnt * sizeof (uint64_t));
@@ -671,9 +700,11 @@ int mlx4_alloc_qp_buf(struct ibv_context *context, struct ibv_qp_cap *cap,
 	}
 
 	for (qp->rq.wqe_shift = 4;
-	     1 << qp->rq.wqe_shift < qp->rq.max_gs * sizeof (struct mlx4_wqe_data_seg);
+	     1 << qp->rq.wqe_shift < wqe_size;
 	     qp->rq.wqe_shift++)
 		; /* nothing */
+	if (mlx4qp_attr)
+		mlx4qp_attr->inl_recv_sz = 1 << qp->rq.wqe_shift;
 
 	qp->buf_size = (qp->rq.wqe_cnt << qp->rq.wqe_shift) +
 		(qp->sq.wqe_cnt << qp->sq.wqe_shift);

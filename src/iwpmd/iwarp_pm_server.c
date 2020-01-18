@@ -32,6 +32,8 @@
  */
 
 #include "config.h"
+#include <systemd/sd-daemon.h>
+#include <getopt.h>
 #include "iwarp_pm.h"
 
 static const char iwpm_ulib_name [] = "iWarpPortMapperUser";
@@ -1355,42 +1357,16 @@ iwarp_port_mapper_exit:
 
 /**
  * daemonize_iwpm_server - Make iwarp port mapper a daemon process
- */ 
+ */
 static void daemonize_iwpm_server(void)
 {
-	pid_t pid, sid;
-
-	/* check if already a daemon */
-	if (getppid() == 1) return;
-
-    	pid = fork();
-    	if (pid < 0) {
-		syslog(LOG_WARNING, "daemonize_iwpm_server: Couldn't fork a new process\n");
-        	exit(EXIT_FAILURE);
-    	}
-
-    	/* exit the parent process */
-	if (pid > 0)
-        	exit(EXIT_SUCCESS);
-
-	umask(0); /* change file mode mask */
-	sid = setsid();	/* create a new session, new group, no tty */
-	if (sid < 0) {
-    		syslog(LOG_WARNING, "daemonize_iwpm_server: Couldn't create new session\n");
-        	exit(EXIT_FAILURE);
-    	}
-
-    	if ((chdir("/")) < 0) {
-		syslog(LOG_WARNING, "daemonize_iwpm_server: Couldn't change the current directory\n");
-        	exit(EXIT_FAILURE);
-   	}
+	if (daemon(0, 0) != 0) {
+		syslog(LOG_ERR, "Failed to daemonize\n");
+		exit(EXIT_FAILURE);
+	}
 
 	syslog(LOG_WARNING, "daemonize_iwpm_server: Starting iWarp Port Mapper V%d process\n",
 				iwpm_version);
-	/* close standard IO streams */
-	close(STDIN_FILENO);
-	close(STDOUT_FILENO);
-	close(STDERR_FILENO);
 }
 
 int main(int argc, char *argv[])
@@ -1398,11 +1374,35 @@ int main(int argc, char *argv[])
 	__u32 iwarp_clients[IWARP_PM_MAX_CLIENTS];
 	int known_clients;
 	FILE *fp;
+	int c;
 	int ret = EXIT_FAILURE;
+	bool systemd = false;
 
-	openlog("iWarpPortMapper", LOG_CONS | LOG_PID, LOG_DAEMON);
+	while (1) {
+		static const struct option long_opts[] = {
+			{"systemd", 0, NULL, 's'},
+			{}
+		};
 
-	daemonize_iwpm_server();
+		c = getopt_long(argc, argv, "fs", long_opts, NULL);
+		if (c == -1)
+			break;
+
+		switch (c) {
+		case 's':
+			systemd = true;
+			break;
+		default:
+			break;
+
+		}
+	}
+
+	openlog(NULL, LOG_NDELAY | LOG_CONS | LOG_PID, LOG_DAEMON);
+
+	if (!systemd)
+		daemonize_iwpm_server();
+	umask(0); /* change file mode mask */
 
 	fp = fopen(IWPM_CONFIG_FILE, "r");
 	if (fp) {
@@ -1448,6 +1448,10 @@ int main(int argc, char *argv[])
 
 	known_clients = init_iwpm_clients(&iwarp_clients[0]);
 	send_iwpm_mapinfo_request(netlink_sock, &iwarp_clients[0], known_clients);
+
+	if (systemd)
+		sd_notify(0, "READY=1");
+
 	iwarp_port_mapper(); /* start iwarp port mapper process */
 
 	free_iwpm_mapped_ports();

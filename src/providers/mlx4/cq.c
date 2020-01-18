@@ -40,59 +40,15 @@
 #include <string.h>
 
 #include <util/compiler.h>
+#include <util/mmio.h>
 #include <infiniband/opcode.h>
 
 #include "mlx4.h"
-#include "doorbell.h"
-
-enum {
-	MLX4_CQ_DOORBELL			= 0x20
-};
 
 enum {
 	CQ_OK					=  0,
 	CQ_EMPTY				= -1,
 	CQ_POLL_ERR				= -2
-};
-
-#define MLX4_CQ_DB_REQ_NOT_SOL			(1 << 24)
-#define MLX4_CQ_DB_REQ_NOT			(2 << 24)
-
-enum {
-	MLX4_CQE_VLAN_PRESENT_MASK		= 1 << 29,
-	MLX4_CQE_QPN_MASK			= 0xffffff,
-};
-
-enum {
-	MLX4_CQE_OWNER_MASK			= 0x80,
-	MLX4_CQE_IS_SEND_MASK			= 0x40,
-	MLX4_CQE_OPCODE_MASK			= 0x1f
-};
-
-enum {
-	MLX4_CQE_SYNDROME_LOCAL_LENGTH_ERR		= 0x01,
-	MLX4_CQE_SYNDROME_LOCAL_QP_OP_ERR		= 0x02,
-	MLX4_CQE_SYNDROME_LOCAL_PROT_ERR		= 0x04,
-	MLX4_CQE_SYNDROME_WR_FLUSH_ERR			= 0x05,
-	MLX4_CQE_SYNDROME_MW_BIND_ERR			= 0x06,
-	MLX4_CQE_SYNDROME_BAD_RESP_ERR			= 0x10,
-	MLX4_CQE_SYNDROME_LOCAL_ACCESS_ERR		= 0x11,
-	MLX4_CQE_SYNDROME_REMOTE_INVAL_REQ_ERR		= 0x12,
-	MLX4_CQE_SYNDROME_REMOTE_ACCESS_ERR		= 0x13,
-	MLX4_CQE_SYNDROME_REMOTE_OP_ERR			= 0x14,
-	MLX4_CQE_SYNDROME_TRANSPORT_RETRY_EXC_ERR	= 0x15,
-	MLX4_CQE_SYNDROME_RNR_RETRY_EXC_ERR		= 0x16,
-	MLX4_CQE_SYNDROME_REMOTE_ABORTED_ERR		= 0x22,
-};
-
-struct mlx4_err_cqe {
-	uint32_t	vlan_my_qpn;
-	uint32_t	reserved1[5];
-	uint16_t	wqe_index;
-	uint8_t		vendor_err;
-	uint8_t		syndrome;
-	uint8_t		reserved2[3];
-	uint8_t		owner_sr_opcode;
 };
 
 static struct mlx4_cqe *get_cqe(struct mlx4_cq *cq, int entry)
@@ -159,7 +115,7 @@ static enum ibv_wc_status mlx4_handle_error_cqe(struct mlx4_err_cqe *cqe)
 static inline void handle_good_req(struct ibv_wc *wc, struct mlx4_cqe *cqe)
 {
 	wc->wc_flags = 0;
-	switch (cqe->owner_sr_opcode & MLX4_CQE_OPCODE_MASK) {
+	switch (mlx4dv_get_cqe_opcode(cqe)) {
 	case MLX4_OPCODE_RDMA_WRITE_IMM:
 		wc->wc_flags |= IBV_WC_WITH_IMM;
 		SWITCH_FALLTHROUGH;
@@ -259,7 +215,7 @@ static inline int mlx4_parse_cqe(struct mlx4_cq *cq,
 		wc->qp_num = qpn;
 
 	is_send  = cqe->owner_sr_opcode & MLX4_CQE_IS_SEND_MASK;
-	is_error = (cqe->owner_sr_opcode & MLX4_CQE_OPCODE_MASK) ==
+	is_error = (mlx4dv_get_cqe_opcode(cqe)) ==
 		MLX4_CQE_OPCODE_ERROR;
 
 	if ((qpn & MLX4_XRC_QPN_BIT) && !is_send) {
@@ -273,7 +229,7 @@ static inline int mlx4_parse_cqe(struct mlx4_cq *cq,
 		if (!srq)
 			return CQ_POLL_ERR;
 	} else {
-		if (!*cur_qp || (qpn != (*cur_qp)->verbs_qp.qp.qp_num)) {
+		if (!*cur_qp || (qpn != (*cur_qp)->qpn_cache)) {
 			/*
 			 * We do not have to take the QP table lock here,
 			 * because CQs will be locked while QPs are removed
@@ -283,7 +239,8 @@ static inline int mlx4_parse_cqe(struct mlx4_cq *cq,
 			if (!*cur_qp)
 				return CQ_POLL_ERR;
 		}
-		srq = ((*cur_qp)->verbs_qp.qp.srq) ? to_msrq((*cur_qp)->verbs_qp.qp.srq) : NULL;
+		srq = ((*cur_qp)->type == MLX4_RSC_TYPE_SRQ) ?
+			to_msrq((*cur_qp)->verbs_qp.qp.srq) : NULL;
 	}
 
 	pwr_id = lazy ? &cq->ibv_cq.wr_id : &wc->wr_id;
@@ -294,7 +251,7 @@ static inline int mlx4_parse_cqe(struct mlx4_cq *cq,
 		*pwr_id = wq->wrid[wq->tail & (wq->wqe_cnt - 1)];
 		++wq->tail;
 	} else if (srq) {
-		wqe_index = htobe16(cqe->wqe_index);
+		wqe_index = be16toh(cqe->wqe_index);
 		*pwr_id = srq->wrid[wqe_index];
 		mlx4_free_srq_wqe(srq, wqe_index);
 	} else {
@@ -322,7 +279,7 @@ static inline int mlx4_parse_cqe(struct mlx4_cq *cq,
 	} else {
 		wc->byte_len = be32toh(cqe->byte_cnt);
 
-		switch (cqe->owner_sr_opcode & MLX4_CQE_OPCODE_MASK) {
+		switch (mlx4dv_get_cqe_opcode(cqe)) {
 		case MLX4_RECV_OPCODE_RDMA_WRITE_IMM:
 			wc->opcode   = IBV_WC_RECV_RDMA_WITH_IMM;
 			wc->wc_flags = IBV_WC_WITH_IMM;
@@ -331,7 +288,7 @@ static inline int mlx4_parse_cqe(struct mlx4_cq *cq,
 		case MLX4_RECV_OPCODE_SEND_INVAL:
 			wc->opcode   = IBV_WC_RECV;
 			wc->wc_flags |= IBV_WC_WITH_INV;
-			wc->imm_data = be32toh(cqe->immed_rss_invalid);
+			wc->invalidated_rkey = be32toh(cqe->immed_rss_invalid);
 			break;
 		case MLX4_RECV_OPCODE_SEND:
 			wc->opcode   = IBV_WC_RECV;
@@ -504,7 +461,7 @@ static enum ibv_wc_opcode mlx4_cq_read_wc_opcode(struct ibv_cq_ex *ibcq)
 	struct mlx4_cq *cq = to_mcq(ibv_cq_ex_to_cq(ibcq));
 
 	if (cq->cqe->owner_sr_opcode & MLX4_CQE_IS_SEND_MASK) {
-		switch (cq->cqe->owner_sr_opcode & MLX4_CQE_OPCODE_MASK) {
+		switch (mlx4dv_get_cqe_opcode(cq->cqe)) {
 		case MLX4_OPCODE_RDMA_WRITE_IMM:
 		case MLX4_OPCODE_RDMA_WRITE:
 			return IBV_WC_RDMA_WRITE;
@@ -524,7 +481,7 @@ static enum ibv_wc_opcode mlx4_cq_read_wc_opcode(struct ibv_cq_ex *ibcq)
 			return IBV_WC_BIND_MW;
 		}
 	} else {
-		switch (cq->cqe->owner_sr_opcode & MLX4_CQE_OPCODE_MASK) {
+		switch (mlx4dv_get_cqe_opcode(cq->cqe)) {
 		case MLX4_RECV_OPCODE_RDMA_WRITE_IMM:
 			return IBV_WC_RECV_RDMA_WITH_IMM;
 		case MLX4_RECV_OPCODE_SEND_INVAL:
@@ -551,7 +508,7 @@ static int mlx4_cq_read_wc_flags(struct ibv_cq_ex *ibcq)
 	int wc_flags = 0;
 
 	if (is_send) {
-		switch (cq->cqe->owner_sr_opcode & MLX4_CQE_OPCODE_MASK) {
+		switch (mlx4dv_get_cqe_opcode(cq->cqe)) {
 		case MLX4_OPCODE_RDMA_WRITE_IMM:
 		case MLX4_OPCODE_SEND_IMM:
 			wc_flags |= IBV_WC_WITH_IMM;
@@ -564,7 +521,7 @@ static int mlx4_cq_read_wc_flags(struct ibv_cq_ex *ibcq)
 				htobe32(MLX4_CQE_STATUS_IPV4_CSUM_OK)) <<
 				IBV_WC_IP_CSUM_OK_SHIFT;
 
-		switch (cq->cqe->owner_sr_opcode & MLX4_CQE_OPCODE_MASK) {
+		switch (mlx4dv_get_cqe_opcode(cq->cqe)) {
 		case MLX4_RECV_OPCODE_RDMA_WRITE_IMM:
 		case MLX4_RECV_OPCODE_SEND_IMM:
 			wc_flags |= IBV_WC_WITH_IMM;
@@ -594,13 +551,16 @@ static uint32_t mlx4_cq_read_wc_vendor_err(struct ibv_cq_ex *ibcq)
 	return ecqe->vendor_err;
 }
 
-static uint32_t mlx4_cq_read_wc_imm_data(struct ibv_cq_ex *ibcq)
+static __be32 mlx4_cq_read_wc_imm_data(struct ibv_cq_ex *ibcq)
 {
 	struct mlx4_cq *cq = to_mcq(ibv_cq_ex_to_cq(ibcq));
 
-	switch (cq->cqe->owner_sr_opcode & MLX4_CQE_OPCODE_MASK) {
+	switch (mlx4dv_get_cqe_opcode(cq->cqe)) {
 	case MLX4_RECV_OPCODE_SEND_INVAL:
-		return be32toh(cq->cqe->immed_rss_invalid);
+		/* This is returning invalidate_rkey which is in host order, see
+		 * ibv_wc_read_invalidated_rkey
+		 */
+		return (__force __be32)be32toh(cq->cqe->immed_rss_invalid);
 	default:
 		return cq->cqe->immed_rss_invalid;
 	}
@@ -682,7 +642,7 @@ void mlx4_cq_fill_pfns(struct mlx4_cq *cq, const struct ibv_cq_init_attr_ex *cq_
 int mlx4_arm_cq(struct ibv_cq *ibvcq, int solicited)
 {
 	struct mlx4_cq *cq = to_mcq(ibvcq);
-	uint32_t doorbell[2];
+	uint64_t doorbell;
 	uint32_t sn;
 	uint32_t ci;
 	uint32_t cmd;
@@ -690,6 +650,10 @@ int mlx4_arm_cq(struct ibv_cq *ibvcq, int solicited)
 	sn  = cq->arm_sn & 3;
 	ci  = cq->cons_index & 0xffffff;
 	cmd = solicited ? MLX4_CQ_DB_REQ_NOT_SOL : MLX4_CQ_DB_REQ_NOT;
+
+	doorbell = sn << 28 | cmd | cq->cqn;
+	doorbell <<= 32;
+	doorbell |= ci;
 
 	*cq->arm_db = htobe32(sn << 28 | cmd | ci);
 
@@ -699,10 +663,8 @@ int mlx4_arm_cq(struct ibv_cq *ibvcq, int solicited)
 	 */
 	udma_to_device_barrier();
 
-	doorbell[0] = htobe32(sn << 28 | cmd | cq->cqn);
-	doorbell[1] = htobe32(ci);
-
-	mlx4_write64(doorbell, to_mctx(ibvcq->context), MLX4_CQ_DOORBELL);
+	mmio_write64_be(to_mctx(ibvcq->context)->uar + MLX4_CQ_DOORBELL,
+			htobe64(doorbell));
 
 	return 0;
 }
@@ -719,6 +681,9 @@ void __mlx4_cq_clean(struct mlx4_cq *cq, uint32_t qpn, struct mlx4_srq *srq)
 	uint8_t owner_bit;
 	int nfreed = 0;
 	int cqe_inc = cq->cqe_size == 64 ? 1 : 0;
+
+	if (!cq || cq->flags & MLX4_CQ_FLAGS_DV_OWNED)
+		return;
 
 	/*
 	 * First we need to find the current producer index, so we
@@ -739,7 +704,7 @@ void __mlx4_cq_clean(struct mlx4_cq *cq, uint32_t qpn, struct mlx4_srq *srq)
 		cqe = get_cqe(cq, prod_index & cq->ibv_cq.cqe);
 		cqe += cqe_inc;
 		if (srq && srq->ext_srq &&
-		    be32toh(cqe->g_mlpath_rqpn & MLX4_CQE_QPN_MASK) == srq->verbs_srq.srq_num &&
+		    (be32toh(cqe->g_mlpath_rqpn) & MLX4_CQE_QPN_MASK) == srq->verbs_srq.srq_num &&
 		    !(cqe->owner_sr_opcode & MLX4_CQE_IS_SEND_MASK)) {
 			mlx4_free_srq_wqe(srq, be16toh(cqe->wqe_index));
 			++nfreed;
@@ -795,7 +760,7 @@ void mlx4_cq_resize_copy_cqes(struct mlx4_cq *cq, void *buf, int old_cqe)
 	cqe = get_cqe(cq, (i & old_cqe));
 	cqe += cqe_inc;
 
-	while ((cqe->owner_sr_opcode & MLX4_CQE_OPCODE_MASK) != MLX4_CQE_OPCODE_RESIZE) {
+	while ((mlx4dv_get_cqe_opcode(cqe)) != MLX4_CQE_OPCODE_RESIZE) {
 		cqe->owner_sr_opcode = (cqe->owner_sr_opcode & ~MLX4_CQE_OWNER_MASK) |
 			(((i + 1) & (cq->ibv_cq.cqe + 1)) ? MLX4_CQE_OWNER_MASK : 0);
 		memcpy(buf + ((i + 1) & cq->ibv_cq.cqe) * cq->cqe_size,

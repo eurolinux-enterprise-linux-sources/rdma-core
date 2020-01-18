@@ -42,6 +42,8 @@
 #include <sched.h>
 #include <sys/param.h>
 
+#include <util/symver.h>
+
 #include "mlx5.h"
 #include "mlx5-abi.h"
 
@@ -66,18 +68,20 @@ static struct {
 	unsigned		vendor;
 	unsigned		device;
 } hca_table[] = {
-	HCA(MELLANOX, 4113),	/* MT4113 Connect-IB */
-	HCA(MELLANOX, 4114),	/* Connect-IB Virtual Function */
-	HCA(MELLANOX, 4115),	/* ConnectX-4 */
-	HCA(MELLANOX, 4116),	/* ConnectX-4 Virtual Function */
-	HCA(MELLANOX, 4117),	/* ConnectX-4LX */
-	HCA(MELLANOX, 4118),	/* ConnectX-4LX Virtual Function */
-	HCA(MELLANOX, 4119),	/* ConnectX-5, PCIe 3.0 */
-	HCA(MELLANOX, 4120),	/* ConnectX-5 Virtual Function */
-	HCA(MELLANOX, 4121),    /* ConnectX-5 Ex */
-	HCA(MELLANOX, 4122),	/* ConnectX-5 Ex VF */
-	HCA(MELLANOX, 4123),    /* ConnectX-6 */
-	HCA(MELLANOX, 4124),	/* ConnectX-6 VF */
+	HCA(MELLANOX, 0x1011),	/* MT4113 Connect-IB */
+	HCA(MELLANOX, 0x1012),	/* Connect-IB Virtual Function */
+	HCA(MELLANOX, 0x1013),	/* ConnectX-4 */
+	HCA(MELLANOX, 0x1014),	/* ConnectX-4 Virtual Function */
+	HCA(MELLANOX, 0x1015),	/* ConnectX-4LX */
+	HCA(MELLANOX, 0x1016),	/* ConnectX-4LX Virtual Function */
+	HCA(MELLANOX, 0x1017),	/* ConnectX-5, PCIe 3.0 */
+	HCA(MELLANOX, 0x1018),	/* ConnectX-5 Virtual Function */
+	HCA(MELLANOX, 0x1019),    /* ConnectX-5 Ex */
+	HCA(MELLANOX, 0x101a),	/* ConnectX-5 Ex VF */
+	HCA(MELLANOX, 0x101b),    /* ConnectX-6 */
+	HCA(MELLANOX, 0x101c),	/* ConnectX-6 VF */
+	HCA(MELLANOX, 0xa2d2),	/* BlueField integrated ConnectX-5 network controller */
+	HCA(MELLANOX, 0xa2d3),	/* BlueField integrated ConnectX-5 network controller VF */
 };
 
 uint32_t mlx5_debug_mask = 0;
@@ -612,12 +616,27 @@ static int mlx5_map_internal_clock(struct mlx5_device *mdev,
 int mlx5dv_query_device(struct ibv_context *ctx_in,
 			 struct mlx5dv_context *attrs_out)
 {
-	attrs_out->comp_mask = 0;
+	struct mlx5_context *mctx = to_mctx(ctx_in);
+	uint64_t comp_mask_out = 0;
+
 	attrs_out->version   = 0;
 	attrs_out->flags     = 0;
 
-	if (to_mctx(ctx_in)->cqe_version == MLX5_CQE_VERSION_V1)
+	if (mctx->cqe_version == MLX5_CQE_VERSION_V1)
 		attrs_out->flags |= MLX5DV_CONTEXT_FLAGS_CQE_V1;
+
+	if (mctx->vendor_cap_flags & MLX5_VENDOR_CAP_FLAGS_MPW_ALLOWED)
+		attrs_out->flags |= MLX5DV_CONTEXT_FLAGS_MPW_ALLOWED;
+
+	if (attrs_out->comp_mask & MLX5DV_CONTEXT_MASK_CQE_COMPRESION) {
+		attrs_out->cqe_comp_caps = mctx->cqe_comp_caps;
+		comp_mask_out |= MLX5DV_CONTEXT_MASK_CQE_COMPRESION;
+	}
+
+	if (mctx->vendor_cap_flags & MLX5_VENDOR_CAP_FLAGS_ENHANCED_MPW)
+		attrs_out->flags |= MLX5DV_CONTEXT_FLAGS_ENHANCED_MPW;
+
+	attrs_out->comp_mask = comp_mask_out;
 
 	return 0;
 }
@@ -626,8 +645,8 @@ static int mlx5dv_get_qp(struct ibv_qp *qp_in,
 			 struct mlx5dv_qp *qp_out)
 {
 	struct mlx5_qp *mqp = to_mqp(qp_in);
+	uint64_t mask_out = 0;
 
-	qp_out->comp_mask = 0;
 	qp_out->dbrec     = mqp->db;
 
 	if (mqp->sq_buf_size)
@@ -642,12 +661,19 @@ static int mlx5dv_get_qp(struct ibv_qp *qp_in,
 	qp_out->rq.wqe_cnt = mqp->rq.wqe_cnt;
 	qp_out->rq.stride  = 1 << mqp->rq.wqe_shift;
 
-	qp_out->bf.reg    = mqp->bf->reg;
+	qp_out->bf.reg	   = mqp->bf->reg;
+
+	if (qp_out->comp_mask & MLX5DV_QP_MASK_UAR_MMAP_OFFSET) {
+		qp_out->uar_mmap_offset = mqp->bf->uar_mmap_offset;
+		mask_out |= MLX5DV_QP_MASK_UAR_MMAP_OFFSET;
+	}
 
 	if (mqp->bf->uuarn > 0)
 		qp_out->bf.size = mqp->bf->buf_size;
 	else
 		qp_out->bf.size = 0;
+
+	qp_out->comp_mask = mask_out;
 
 	return 0;
 }
@@ -664,7 +690,7 @@ static int mlx5dv_get_cq(struct ibv_cq *cq_in,
 	cq_out->cqe_size  = mcq->cqe_sz;
 	cq_out->buf       = mcq->active_buf->buf;
 	cq_out->dbrec     = mcq->dbrec;
-	cq_out->uar	  = mctx->uar;
+	cq_out->cq_uar	  = mctx->uar[0];
 
 	mcq->flags	 |= MLX5_CQ_FLAGS_DV_OWNED;
 
@@ -702,7 +728,9 @@ static int mlx5dv_get_srq(struct ibv_srq *srq_in,
 	return 0;
 }
 
-int mlx5dv_init_obj(struct mlx5dv_obj *obj, uint64_t obj_type)
+LATEST_SYMVER_FUNC(mlx5dv_init_obj, 1_2, "MLX5_1.2",
+		   int,
+		   struct mlx5dv_obj *obj, uint64_t obj_type)
 {
 	int ret = 0;
 
@@ -716,6 +744,47 @@ int mlx5dv_init_obj(struct mlx5dv_obj *obj, uint64_t obj_type)
 		ret = mlx5dv_get_rwq(obj->rwq.in, obj->rwq.out);
 
 	return ret;
+}
+
+COMPAT_SYMVER_FUNC(mlx5dv_init_obj, 1_0, "MLX5_1.0",
+		   int,
+		   struct mlx5dv_obj *obj, uint64_t obj_type)
+{
+	int ret = 0;
+
+	ret = __mlx5dv_init_obj_1_2(obj, obj_type);
+	if (!ret && (obj_type & MLX5DV_OBJ_CQ)) {
+		/* ABI version 1.0 returns the void ** in this memory
+		 * location
+		 */
+		obj->cq.out->cq_uar = to_mctx(obj->cq.in->context)->uar;
+	}
+	return ret;
+}
+
+static off_t get_uar_mmap_offset(int idx, int page_size)
+{
+	off_t offset = 0;
+
+	set_command(MLX5_MMAP_GET_REGULAR_PAGES_CMD, &offset);
+	set_index(idx, &offset);
+	return offset * page_size;
+}
+
+int mlx5dv_set_context_attr(struct ibv_context *ibv_ctx,
+			enum mlx5dv_set_ctx_attr_type type, void *attr)
+{
+	struct mlx5_context *ctx = to_mctx(ibv_ctx);
+
+	switch (type) {
+	case MLX5DV_CTX_ATTR_BUF_ALLOCATORS:
+		ctx->extern_alloc = *((struct mlx5dv_ctx_allocators *)attr);
+		break;
+	default:
+		return ENOTSUP;
+	}
+
+	return 0;
 }
 
 static void adjust_uar_info(struct mlx5_device *mdev,
@@ -827,6 +896,7 @@ static int mlx5_init_context(struct verbs_device *vdev,
 	}
 
 	context->cmds_supp_uhw = resp.cmds_supp_uhw;
+	context->vendor_cap_flags = 0;
 
 	pthread_mutex_init(&context->qp_table_mutex, NULL);
 	pthread_mutex_init(&context->srq_table_mutex, NULL);
@@ -843,11 +913,9 @@ static int mlx5_init_context(struct verbs_device *vdev,
 
 	num_sys_page_map = context->tot_uuars / (context->num_uars_per_page * MLX5_NUM_NON_FP_BFREGS_PER_UAR);
 	for (i = 0; i < num_sys_page_map; ++i) {
-		offset = 0;
-		set_command(MLX5_MMAP_GET_REGULAR_PAGES_CMD, &offset);
-		set_index(i, &offset);
+		offset = get_uar_mmap_offset(i, page_size);
 		context->uar[i] = mmap(NULL, page_size, PROT_WRITE, MAP_SHARED,
-				       cmd_fd, page_size * offset);
+				       cmd_fd, offset);
 		if (context->uar[i] == MAP_FAILED) {
 			context->uar[i] = NULL;
 			goto err_free_bf;
@@ -866,6 +934,7 @@ static int mlx5_init_context(struct verbs_device *vdev,
 				if (bfi)
 					context->bfs[bfi].buf_size = context->bf_reg_size / 2;
 				context->bfs[bfi].uuarn = bfi;
+				context->bfs[bfi].uar_mmap_offset = get_uar_mmap_offset(i, page_size);
 			}
 		}
 	}
@@ -877,8 +946,6 @@ static int mlx5_init_context(struct verbs_device *vdev,
 		context->core_clock.offset = resp.hca_core_clock_offset;
 		mlx5_map_internal_clock(mdev, ctx);
 	}
-
-	mlx5_spinlock_init(&context->lock32);
 
 	context->prefer_bf = get_always_bf();
 	context->shut_up_bf = get_shut_up_bf();
@@ -952,9 +1019,17 @@ static void mlx5_cleanup_context(struct verbs_device *device,
 	close_debug_file(context);
 }
 
+static void mlx5_uninit_device(struct verbs_device *verbs_device)
+{
+	struct mlx5_device *dev = to_mdev(&verbs_device->device);
+
+	free(dev);
+}
+
 static struct verbs_device_ops mlx5_dev_ops = {
 	.init_context = mlx5_init_context,
 	.uninit_context = mlx5_cleanup_context,
+	.uninit_device = mlx5_uninit_device
 };
 
 static struct verbs_device *mlx5_driver_init(const char *uverbs_sys_path,
@@ -993,7 +1068,7 @@ found:
 		return NULL;
 	}
 
-	dev = malloc(sizeof *dev);
+	dev = calloc(1, sizeof *dev);
 	if (!dev) {
 		fprintf(stderr, PFX "Fatal: couldn't allocate device for %s\n",
 			uverbs_sys_path);

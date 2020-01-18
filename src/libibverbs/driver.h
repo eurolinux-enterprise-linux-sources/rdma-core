@@ -35,8 +35,11 @@
 #ifndef INFINIBAND_DRIVER_H
 #define INFINIBAND_DRIVER_H
 
+#include <stdatomic.h>
 #include <infiniband/verbs.h>
 #include <infiniband/kern-abi.h>
+#include <ccan/list.h>
+#include <config.h>
 
 #ifdef __cplusplus
 #  define BEGIN_C_DECLS extern "C" {
@@ -45,13 +48,6 @@
 #  define BEGIN_C_DECLS
 #  define END_C_DECLS
 #endif /* __cplusplus */
-
-/*
- * Extension that low-level drivers should add to their .so filename
- * (probably via libtool "-release" option).  For example a low-level
- * driver named "libfoo" should build a plug-in named "libfoo-rdmav2.so".
- */
-#define IBV_DEVICE_LIBRARY_EXTENSION rdmav2
 
 struct verbs_device;
 
@@ -111,6 +107,7 @@ struct verbs_device_ops {
 			    struct ibv_context *ctx, int cmd_fd);
 	void (*uninit_context)(struct verbs_device *device,
 			       struct ibv_context *ctx);
+	void (*uninit_device)(struct verbs_device *device);
 };
 
 /* Must change the PRIVATE IBVERBS_PRIVATE_ symbol if this is changed */
@@ -119,6 +116,9 @@ struct verbs_device {
 	const struct verbs_device_ops *ops;
 	size_t	sz;
 	size_t	size_of_context;
+	atomic_int refcount;
+	struct list_node entry;
+	struct ibv_sysfs_dev *sysfs;
 };
 
 static inline struct verbs_device *
@@ -129,7 +129,20 @@ verbs_get_device(const struct ibv_device *dev)
 
 typedef struct verbs_device *(*verbs_driver_init_func)(const char *uverbs_sys_path,
 						       int abi_version);
+
+/* Wire the IBVERBS_PRIVATE version number into the verbs_register_driver
+ * symbol name.  This guarentees we link to the correct set of symbols even if
+ * statically linking or using a dynmic linker with symbol versioning turned
+ * off.
+ */
+#define ___make_verbs_register_driver(x) verbs_register_driver_ ## x
+#define __make_verbs_register_driver(x)  ___make_verbs_register_driver(x)
+#define verbs_register_driver __make_verbs_register_driver(IBVERBS_PABI_VERSION)
+
 void verbs_register_driver(const char *name, verbs_driver_init_func init_func);
+void verbs_init_cq(struct ibv_cq *cq, struct ibv_context *context,
+		       struct ibv_comp_channel *channel,
+		       void *cq_context);
 
 int ibv_cmd_get_context(struct ibv_context *context, struct ibv_get_context *cmd,
 			size_t cmd_size, struct ibv_get_context_resp *resp,

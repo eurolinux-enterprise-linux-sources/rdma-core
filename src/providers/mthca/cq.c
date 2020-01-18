@@ -93,14 +93,14 @@ enum {
 };
 
 struct mthca_cqe {
-	uint32_t	my_qpn;
-	uint32_t	my_ee;
-	uint32_t	rqpn;
-	uint16_t	sl_g_mlpath;
-	uint16_t	rlid;
-	uint32_t	imm_etype_pkey_eec;
-	uint32_t	byte_cnt;
-	uint32_t	wqe;
+	__be32		my_qpn;
+	__be32		my_ee;
+	__be32		rqpn;
+	__be16		sl_g_mlpath;
+	__be16		rlid;
+	__be32		imm_etype_pkey_eec;
+	__be32		byte_cnt;
+	__be32		wqe;
 	uint8_t		opcode;
 	uint8_t		is_send;
 	uint8_t		reserved;
@@ -108,13 +108,13 @@ struct mthca_cqe {
 };
 
 struct mthca_err_cqe {
-	uint32_t	my_qpn;
-	uint32_t	reserved1[3];
+	__be32		my_qpn;
+	__be32		reserved1[3];
 	uint8_t		syndrome;
 	uint8_t		vendor_err;
-	uint16_t	db_cnt;
-	uint32_t	reserved2;
-	uint32_t	wqe;
+	__be16		db_cnt;
+	__be32		reserved2;
+	__be32		wqe;
 	uint8_t		opcode;
 	uint8_t		reserved3[2];
 	uint8_t		owner;
@@ -154,20 +154,20 @@ static inline void update_cons_index(struct mthca_cq *cq, int incr)
 		*cq->set_ci_db = htobe32(cq->cons_index);
 		mmio_ordered_writes_hack();
 	} else {
-		doorbell[0] = htobe32(MTHCA_TAVOR_CQ_DB_INC_CI | cq->cqn);
-		doorbell[1] = htobe32(incr - 1);
+		doorbell[0] = MTHCA_TAVOR_CQ_DB_INC_CI | cq->cqn;
+		doorbell[1] = incr - 1;
 
-		mthca_write64(doorbell, to_mctx(cq->ibv_cq.context), MTHCA_CQ_DOORBELL);
+		mthca_write64(doorbell, to_mctx(cq->ibv_cq.context)->uar + MTHCA_CQ_DOORBELL);
 	}
 }
 
 static void dump_cqe(void *cqe_ptr)
 {
-	uint32_t *cqe = cqe_ptr;
+	__be32 *cqe = cqe_ptr;
 	int i;
 
 	for (i = 0; i < 8; ++i)
-		printf("  [%2x] %08x\n", i * 4, be32toh(((uint32_t *) cqe)[i]));
+		printf("  [%2x] %08x\n", i * 4, be32toh(cqe[i]));
 }
 
 static int handle_error_cqe(struct mthca_cq *cq,
@@ -177,7 +177,7 @@ static int handle_error_cqe(struct mthca_cq *cq,
 {
 	int err;
 	int dbd;
-	uint32_t new_wqe;
+	__be32 new_wqe;
 
 	if (cqe->syndrome == SYNDROME_LOCAL_QP_OP_ERR) {
 		printf("local QP operation err "
@@ -340,7 +340,7 @@ static inline int mthca_poll_one(struct mthca_cq *cq,
 	} else if ((*cur_qp)->ibv_qp.srq) {
 		uint32_t wqe;
 		srq = to_msrq((*cur_qp)->ibv_qp.srq);
-		wqe = htobe32(cqe->wqe);
+		wqe = be32toh(cqe->wqe);
 		wq = NULL;
 		wqe_index = wqe >> srq->wqe_shift;
 		wc->wr_id = srq->wrid[wqe_index];
@@ -485,13 +485,12 @@ int mthca_tavor_arm_cq(struct ibv_cq *cq, int solicited)
 {
 	uint32_t doorbell[2];
 
-	doorbell[0] = htobe32((solicited ?
-			     MTHCA_TAVOR_CQ_DB_REQ_NOT_SOL :
-			     MTHCA_TAVOR_CQ_DB_REQ_NOT)      |
-			    to_mcq(cq)->cqn);
+	doorbell[0] = (solicited ? MTHCA_TAVOR_CQ_DB_REQ_NOT_SOL
+				 : MTHCA_TAVOR_CQ_DB_REQ_NOT) |
+		      to_mcq(cq)->cqn;
 	doorbell[1] = 0xffffffff;
 
-	mthca_write64(doorbell, to_mctx(cq->context), MTHCA_CQ_DOORBELL);
+	mthca_write64(doorbell, to_mctx(cq->context)->uar + MTHCA_CQ_DOORBELL);
 
 	return 0;
 }
@@ -501,16 +500,14 @@ int mthca_arbel_arm_cq(struct ibv_cq *ibvcq, int solicited)
 	struct mthca_cq *cq = to_mcq(ibvcq);
 	uint32_t doorbell[2];
 	uint32_t sn;
-	uint32_t ci;
 
 	sn = cq->arm_sn & 3;
-	ci = htobe32(cq->cons_index);
 
-	doorbell[0] = ci;
-	doorbell[1] = htobe32((cq->cqn << 8) | (2 << 5) | (sn << 3) |
-			    (solicited ? 1 : 2));
+	doorbell[0] = cq->cons_index;
+	doorbell[1] =
+	    (cq->cqn << 8) | (2 << 5) | (sn << 3) | (solicited ? 1 : 2);
 
-	mthca_write_db_rec(doorbell, cq->arm_db);
+	mthca_write64(doorbell, cq->arm_db);
 
 	/*
 	 * Make sure that the doorbell record in host memory is
@@ -518,14 +515,13 @@ int mthca_arbel_arm_cq(struct ibv_cq *ibvcq, int solicited)
 	 */
 	udma_to_device_barrier();
 
-	doorbell[0] = htobe32((sn << 28)                       |
-			    (solicited ?
-			     MTHCA_ARBEL_CQ_DB_REQ_NOT_SOL :
-			     MTHCA_ARBEL_CQ_DB_REQ_NOT)      |
-			    cq->cqn);
-	doorbell[1] = ci;
+	doorbell[0] = (sn << 28) | (solicited ? MTHCA_ARBEL_CQ_DB_REQ_NOT_SOL
+					      : MTHCA_ARBEL_CQ_DB_REQ_NOT) |
+		      cq->cqn;
+	doorbell[1] = cq->cons_index;
 
-	mthca_write64(doorbell, to_mctx(ibvcq->context), MTHCA_CQ_DOORBELL);
+	mthca_write64(doorbell,
+		      to_mctx(ibvcq->context)->uar + MTHCA_CQ_DOORBELL);
 
 	return 0;
 }

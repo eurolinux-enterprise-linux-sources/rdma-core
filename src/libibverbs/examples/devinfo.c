@@ -52,9 +52,9 @@ static int null_gid(union ibv_gid *gid)
 		 gid->raw[12] | gid->raw[13] | gid->raw[14] | gid->raw[15]);
 }
 
-static const char *guid_str(uint64_t node_guid, char *str)
+static const char *guid_str(__be64 _node_guid, char *str)
 {
-	node_guid = be64toh(node_guid);
+	uint64_t node_guid = be64toh(_node_guid);
 	sprintf(str, "%04x:%04x:%04x:%04x",
 		(unsigned) (node_guid >> 48) & 0xffff,
 		(unsigned) (node_guid >> 32) & 0xffff,
@@ -330,7 +330,7 @@ static void print_odp_caps(const struct ibv_odp_caps *caps)
 
 static void print_device_cap_flags_ex(uint64_t device_cap_flags_ex)
 {
-	uint64_t ex_flags = device_cap_flags_ex & 0xffffffff00000000;
+	uint64_t ex_flags = device_cap_flags_ex & 0xffffffff00000000ULL;
 	uint64_t unknown_flags = ~(IBV_DEVICE_RAW_SCATTER_FCS);
 
 	if (ex_flags & IBV_DEVICE_RAW_SCATTER_FCS)
@@ -399,6 +399,19 @@ static void print_packet_pacing_caps(const struct ibv_packet_pacing_caps *caps)
 			printf("\t\t\t\t\tUnknown flags: 0x%" PRIX32 "\n",
 			       caps->supported_qpts & unknown_general_caps);
 	}
+}
+
+static void print_raw_packet_caps(uint32_t raw_packet_caps)
+{
+	printf("\traw packet caps:\n");
+	if (raw_packet_caps & IBV_RAW_PACKET_CAP_CVLAN_STRIPPING)
+		printf("\t\t\t\t\tC-VLAN stripping offload\n");
+	if (raw_packet_caps & IBV_RAW_PACKET_CAP_SCATTER_FCS)
+		printf("\t\t\t\t\tScatter FCS offload\n");
+	if (raw_packet_caps & IBV_RAW_PACKET_CAP_IP_CSUM)
+		printf("\t\t\t\t\tIP csum offload\n");
+	if (raw_packet_caps & IBV_RAW_PACKET_CAP_DELAY_DROP)
+		printf("\t\t\t\t\tDelay drop\n");
 }
 
 static int print_hca_cap(struct ibv_device *ib_dev, uint8_t ib_port)
@@ -498,6 +511,9 @@ static int print_hca_cap(struct ibv_device *ib_dev, uint8_t ib_port)
 			printf("\thca_core_clock:\t\t\t%" PRIu64 "kHZ\n", device_attr.hca_core_clock);
 		else
 			printf("\tcore clock not supported\n");
+
+		if (device_attr.raw_packet_caps)
+			print_raw_packet_caps(device_attr.raw_packet_caps);
 
 		printf("\tdevice_cap_flags_ex:\t\t0x%" PRIX64 "\n", device_attr.device_cap_flags_ex);
 		print_device_cap_flags_ex(device_attr.device_cap_flags_ex);

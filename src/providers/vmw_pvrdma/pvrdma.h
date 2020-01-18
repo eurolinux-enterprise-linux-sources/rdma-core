@@ -56,23 +56,12 @@
 #include <sys/mman.h>
 #include <infiniband/driver.h>
 #include <ccan/minmax.h>
+#include <util/compiler.h>
 
 #define BIT(nr) (1UL << (nr))
 
 #include "pvrdma-abi-fix.h"
 #include "pvrdma_ring.h"
-
-#ifndef likely
-#define likely(x)	__builtin_expect(!!(x), 1)
-#else
-#define likely(x)	(x)
-#endif
-
-#ifndef unlikely
-#define unlikely(x)	__builtin_expect(!!(x), 0)
-#else
-#define unlikely(x)	(x)
-#endif
 
 #define PFX "pvrdma: "
 
@@ -163,7 +152,7 @@ struct pvrdma_qp {
 	struct pvrdma_buf		sbuf;
 	int				max_inline_data;
 	int				buf_size;
-	uint32_t			sq_signal_bits;
+	__be32				sq_signal_bits;
 	int				sq_spare_wqes;
 	struct pvrdma_wq		sq;
 	struct pvrdma_wq		rq;
@@ -221,12 +210,12 @@ static inline struct pvrdma_ah *to_vah(struct ibv_ah *ibah)
 
 static inline void pvrdma_write_uar_qp(void *uar, unsigned value)
 {
-	*(uint32_t *)(uar + PVRDMA_UAR_QP_OFFSET) = htole32(value);
+	*(__le32 *)(uar + PVRDMA_UAR_QP_OFFSET) = htole32(value);
 }
 
 static inline void pvrdma_write_uar_cq(void *uar, unsigned value)
 {
-	*(uint32_t *)(uar + PVRDMA_UAR_CQ_OFFSET) = htole32(value);
+	*(__le32 *)(uar + PVRDMA_UAR_CQ_OFFSET) = htole32(value);
 }
 
 static inline int ibv_send_flags_to_pvrdma(int flags)

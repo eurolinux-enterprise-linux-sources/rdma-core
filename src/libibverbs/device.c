@@ -43,62 +43,81 @@
 #include <alloca.h>
 #include <errno.h>
 
+#include <util/symver.h>
 #include "ibverbs.h"
 
-#pragma GCC diagnostic ignored "-Wmissing-prototypes"
+static pthread_mutex_t dev_list_lock = PTHREAD_MUTEX_INITIALIZER;
+static int initialized;
+static struct list_head device_list = LIST_HEAD_INIT(device_list);
 
-static pthread_once_t device_list_once = PTHREAD_ONCE_INIT;
-static int num_devices;
-static struct ibv_device **device_list;
-
-static void count_devices(void)
+LATEST_SYMVER_FUNC(ibv_get_device_list, 1_1, "IBVERBS_1.1",
+		   struct ibv_device **,
+		   int *num)
 {
-	num_devices = ibverbs_init(&device_list);
-}
-
-struct ibv_device **__ibv_get_device_list(int *num)
-{
-	struct ibv_device **l;
-	int i;
+	struct ibv_device **l = NULL;
+	struct verbs_device *device;
+	int num_devices;
+	int i = 0;
 
 	if (num)
 		*num = 0;
 
-	pthread_once(&device_list_once, count_devices);
+	pthread_mutex_lock(&dev_list_lock);
+	if (!initialized) {
+		int ret = ibverbs_init();
+		initialized = (ret < 0) ? ret : 1;
+	}
 
+	if (initialized < 0) {
+		errno = -initialized;
+		goto out;
+	}
+
+	num_devices = ibverbs_get_device_list(&device_list);
 	if (num_devices < 0) {
 		errno = -num_devices;
-		return NULL;
+		goto out;
 	}
 
 	l = calloc(num_devices + 1, sizeof (struct ibv_device *));
 	if (!l) {
 		errno = ENOMEM;
-		return NULL;
+		goto out;
 	}
 
-	for (i = 0; i < num_devices; ++i)
-		l[i] = device_list[i];
+	list_for_each(&device_list, device, entry) {
+		l[i] = &device->device;
+		ibverbs_device_hold(l[i]);
+		i++;
+	}
 	if (num)
 		*num = num_devices;
-
+out:
+	pthread_mutex_unlock(&dev_list_lock);
 	return l;
 }
-default_symver(__ibv_get_device_list, ibv_get_device_list);
 
-void __ibv_free_device_list(struct ibv_device **list)
+LATEST_SYMVER_FUNC(ibv_free_device_list, 1_1, "IBVERBS_1.1",
+		   void,
+		   struct ibv_device **list)
 {
+	int i;
+
+	for (i = 0; list[i]; i++)
+		ibverbs_device_put(list[i]);
 	free(list);
 }
-default_symver(__ibv_free_device_list, ibv_free_device_list);
 
-const char *__ibv_get_device_name(struct ibv_device *device)
+LATEST_SYMVER_FUNC(ibv_get_device_name, 1_1, "IBVERBS_1.1",
+		   const char *,
+		   struct ibv_device *device)
 {
 	return device->name;
 }
-default_symver(__ibv_get_device_name, ibv_get_device_name);
 
-uint64_t __ibv_get_device_guid(struct ibv_device *device)
+LATEST_SYMVER_FUNC(ibv_get_device_guid, 1_1, "IBVERBS_1.1",
+		   __be64,
+		   struct ibv_device *device)
 {
 	char attr[24];
 	uint64_t guid = 0;
@@ -118,10 +137,30 @@ uint64_t __ibv_get_device_guid(struct ibv_device *device)
 
 	return htobe64(guid);
 }
-default_symver(__ibv_get_device_guid, ibv_get_device_guid);
 
-struct ibv_cq_ex *__lib_ibv_create_cq_ex(struct ibv_context *context,
-					 struct ibv_cq_init_attr_ex *cq_attr)
+void verbs_init_cq(struct ibv_cq *cq, struct ibv_context *context,
+		       struct ibv_comp_channel *channel,
+		       void *cq_context)
+{
+	cq->context		   = context;
+	cq->channel		   = channel;
+
+	if (cq->channel) {
+		pthread_mutex_lock(&context->mutex);
+		++cq->channel->refcnt;
+		pthread_mutex_unlock(&context->mutex);
+	}
+
+	cq->cq_context		   = cq_context;
+	cq->comp_events_completed  = 0;
+	cq->async_events_completed = 0;
+	pthread_mutex_init(&cq->mutex, NULL);
+	pthread_cond_init(&cq->cond, NULL);
+}
+
+static struct ibv_cq_ex *
+__lib_ibv_create_cq_ex(struct ibv_context *context,
+		       struct ibv_cq_init_attr_ex *cq_attr)
 {
 	struct verbs_context *vctx = verbs_get_ctx(context);
 	struct ibv_cq_ex *cq;
@@ -131,28 +170,18 @@ struct ibv_cq_ex *__lib_ibv_create_cq_ex(struct ibv_context *context,
 		return NULL;
 	}
 
-	pthread_mutex_lock(&context->mutex);
-
 	cq = vctx->priv->create_cq_ex(context, cq_attr);
 
-	if (cq) {
-		cq->context		   = context;
-		cq->channel		   = cq_attr->channel;
-		if (cq->channel)
-			++cq->channel->refcnt;
-		cq->cq_context		   = cq_attr->cq_context;
-		cq->comp_events_completed  = 0;
-		cq->async_events_completed = 0;
-		pthread_mutex_init(&cq->mutex, NULL);
-		pthread_cond_init(&cq->cond, NULL);
-	}
-
-	pthread_mutex_unlock(&context->mutex);
+	if (cq)
+		verbs_init_cq(ibv_cq_ex_to_cq(cq), context,
+			        cq_attr->channel, cq_attr->cq_context);
 
 	return cq;
 }
 
-struct ibv_context *__ibv_open_device(struct ibv_device *device)
+LATEST_SYMVER_FUNC(ibv_open_device, 1_1, "IBVERBS_1.1",
+		   struct ibv_context *,
+		   struct ibv_device *device)
 {
 	struct verbs_device *verbs_device = verbs_get_device(device);
 	char *devpath;
@@ -228,6 +257,8 @@ struct ibv_context *__ibv_open_device(struct ibv_device *device)
 	context->cmd_fd = cmd_fd;
 	pthread_mutex_init(&context->mutex, NULL);
 
+	ibverbs_device_hold(device);
+
 	return context;
 
 verbs_err:
@@ -237,15 +268,17 @@ err:
 	close(cmd_fd);
 	return NULL;
 }
-default_symver(__ibv_open_device, ibv_open_device);
 
-int __ibv_close_device(struct ibv_context *context)
+LATEST_SYMVER_FUNC(ibv_close_device, 1_1, "IBVERBS_1.1",
+		   int,
+		   struct ibv_context *context)
 {
 	int async_fd = context->async_fd;
 	int cmd_fd   = context->cmd_fd;
 	int cq_fd    = -1;
 	struct verbs_context *context_ex;
 	struct verbs_device *verbs_device = verbs_get_device(context->device);
+	struct ibv_device *device = context->device;
 
 	context_ex = verbs_get_ctx(context);
 	if (context_ex) {
@@ -260,13 +293,15 @@ int __ibv_close_device(struct ibv_context *context)
 	close(cmd_fd);
 	if (abi_ver <= 2)
 		close(cq_fd);
+	ibverbs_device_put(device);
 
 	return 0;
 }
-default_symver(__ibv_close_device, ibv_close_device);
 
-int __ibv_get_async_event(struct ibv_context *context,
-			  struct ibv_async_event *event)
+LATEST_SYMVER_FUNC(ibv_get_async_event, 1_1, "IBVERBS_1.1",
+		   int,
+		   struct ibv_context *context,
+		   struct ibv_async_event *event)
 {
 	struct ibv_kern_async_event ev;
 
@@ -309,9 +344,10 @@ int __ibv_get_async_event(struct ibv_context *context,
 
 	return 0;
 }
-default_symver(__ibv_get_async_event, ibv_get_async_event);
 
-void __ibv_ack_async_event(struct ibv_async_event *event)
+LATEST_SYMVER_FUNC(ibv_ack_async_event, 1_1, "IBVERBS_1.1",
+		   void,
+		   struct ibv_async_event *event)
 {
 	switch (event->event_type) {
 	case IBV_EVENT_CQ_ERR:
@@ -374,4 +410,3 @@ void __ibv_ack_async_event(struct ibv_async_event *event)
 		return;
 	}
 }
-default_symver(__ibv_ack_async_event, ibv_ack_async_event);

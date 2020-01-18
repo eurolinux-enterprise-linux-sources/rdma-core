@@ -43,6 +43,8 @@
 #include "mlx4.h"
 #include "mlx4-abi.h"
 
+int mlx4_cleanup_upon_device_fatal = 0;
+
 #ifndef PCI_VENDOR_ID_MELLANOX
 #define PCI_VENDOR_ID_MELLANOX			0x15b3
 #endif
@@ -118,6 +120,15 @@ static struct ibv_context_ops mlx4_ctx_ops = {
 	.detach_mcast  = ibv_cmd_detach_mcast
 };
 
+static void mlx4_read_env(void)
+{
+	char *env_value;
+
+	env_value = getenv("MLX4_DEVICE_FATAL_CLEANUP");
+	if (env_value)
+		mlx4_cleanup_upon_device_fatal = (strcmp(env_value, "0")) ? 1 : 0;
+}
+
 static int mlx4_map_internal_clock(struct mlx4_device *mdev,
 				   struct ibv_context *ibv_ctx)
 {
@@ -159,6 +170,7 @@ static int mlx4_init_context(struct verbs_device *v_device,
 	context = to_mctx(ibv_ctx);
 	ibv_ctx->cmd_fd = cmd_fd;
 
+	mlx4_read_env();
 	if (dev->abi_version <= MLX4_UVERBS_NO_DEV_CAPS_ABI_VERSION) {
 		if (ibv_cmd_get_context(ibv_ctx, &cmd, sizeof cmd,
 					&resp_v3.ibv_resp, sizeof resp_v3))
@@ -219,7 +231,6 @@ static int mlx4_init_context(struct verbs_device *v_device,
 		context->bf_buf_size = 0;
 	}
 
-	pthread_spin_init(&context->uar_lock, PTHREAD_PROCESS_PRIVATE);
 	ibv_ctx->ops = mlx4_ctx_ops;
 
 	context->hca_core_clock = NULL;
@@ -245,6 +256,11 @@ static int mlx4_init_context(struct verbs_device *v_device,
 	verbs_set_ctx_op(verbs_ctx, create_cq_ex, mlx4_create_cq_ex);
 	verbs_set_ctx_op(verbs_ctx, query_device_ex, mlx4_query_device_ex);
 	verbs_set_ctx_op(verbs_ctx, query_rt_values, mlx4_query_rt_values);
+	verbs_set_ctx_op(verbs_ctx, create_wq, mlx4_create_wq);
+	verbs_set_ctx_op(verbs_ctx, modify_wq, mlx4_modify_wq);
+	verbs_set_ctx_op(verbs_ctx, destroy_wq, mlx4_destroy_wq);
+	verbs_set_ctx_op(verbs_ctx, create_rwq_ind_table, mlx4_create_rwq_ind_table);
+	verbs_set_ctx_op(verbs_ctx, destroy_rwq_ind_table, mlx4_destroy_rwq_ind_table);
 
 	return 0;
 
@@ -263,9 +279,17 @@ static void mlx4_uninit_context(struct verbs_device *v_device,
 		       to_mdev(&v_device->device)->page_size);
 }
 
+static void mlx4_uninit_device(struct verbs_device *verbs_device)
+{
+	struct mlx4_device *dev = to_mdev(&verbs_device->device);
+
+	free(dev);
+}
+
 static struct verbs_device_ops mlx4_dev_ops = {
 	.init_context = mlx4_init_context,
 	.uninit_context = mlx4_uninit_context,
+	.uninit_device = mlx4_uninit_device
 };
 
 static struct verbs_device *mlx4_driver_init(const char *uverbs_sys_path, int abi_version)
@@ -324,4 +348,137 @@ found:
 static __attribute__((constructor)) void mlx4_register_driver(void)
 {
 	verbs_register_driver("mlx4", mlx4_driver_init);
+}
+
+static int mlx4dv_get_qp(struct ibv_qp *qp_in,
+			 struct mlx4dv_qp *qp_out)
+{
+	struct mlx4_qp *mqp = to_mqp(qp_in);
+	struct mlx4_context *ctx = to_mctx(qp_in->context);
+
+	qp_out->comp_mask = 0;
+
+	qp_out->buf.buf = mqp->buf.buf;
+	qp_out->buf.length = mqp->buf.length;
+
+	qp_out->rdb = mqp->db;
+	qp_out->sdb = (uint32_t *) (ctx->uar + MLX4_SEND_DOORBELL);
+	qp_out->doorbell_qpn = mqp->doorbell_qpn;
+
+	qp_out->sq.wqe_cnt = mqp->sq.wqe_cnt;
+	qp_out->sq.wqe_shift = mqp->sq.wqe_shift;
+	qp_out->sq.offset = mqp->sq.offset;
+
+	qp_out->rq.wqe_cnt = mqp->rq.wqe_cnt;
+	qp_out->rq.wqe_shift = mqp->rq.wqe_shift;
+	qp_out->rq.offset = mqp->rq.offset;
+
+	return 0;
+}
+
+static int mlx4dv_get_cq(struct ibv_cq *cq_in,
+			 struct mlx4dv_cq *cq_out)
+{
+	struct mlx4_cq *mcq = to_mcq(cq_in);
+	struct mlx4_context *mctx = to_mctx(cq_in->context);
+	uint64_t mask_out = 0;
+
+	cq_out->buf.buf = mcq->buf.buf;
+	cq_out->buf.length = mcq->buf.length;
+	cq_out->cqn = mcq->cqn;
+	cq_out->set_ci_db = mcq->set_ci_db;
+	cq_out->arm_db = mcq->arm_db;
+	cq_out->arm_sn = mcq->arm_sn;
+	cq_out->cqe_size = mcq->cqe_size;
+	cq_out->cqe_cnt = mcq->ibv_cq.cqe + 1;
+
+	mcq->flags |= MLX4_CQ_FLAGS_DV_OWNED;
+
+	if (cq_out->comp_mask & MLX4DV_CQ_MASK_UAR) {
+		cq_out->cq_uar = mctx->uar;
+		mask_out |= MLX4DV_CQ_MASK_UAR;
+	}
+
+	cq_out->comp_mask = mask_out;
+	return 0;
+}
+
+static int mlx4dv_get_srq(struct ibv_srq *srq_in,
+			  struct mlx4dv_srq *srq_out)
+{
+	struct mlx4_srq *msrq = to_msrq(srq_in);
+
+	srq_out->comp_mask = 0;
+	srq_out->buf.buf = msrq->buf.buf;
+	srq_out->buf.length = msrq->buf.length;
+	srq_out->wqe_shift = msrq->wqe_shift;
+	srq_out->head = msrq->head;
+	srq_out->tail = msrq->tail;
+	srq_out->db = msrq->db;
+
+	return 0;
+}
+
+static int mlx4dv_get_rwq(struct ibv_wq *wq_in, struct mlx4dv_rwq *wq_out)
+{
+	struct mlx4_qp *mqp = wq_to_mqp(wq_in);
+
+	wq_out->comp_mask = 0;
+
+	wq_out->buf.buf = mqp->buf.buf;
+	wq_out->buf.length = mqp->buf.length;
+
+	wq_out->rdb = mqp->db;
+
+	wq_out->rq.wqe_cnt = mqp->rq.wqe_cnt;
+	wq_out->rq.wqe_shift = mqp->rq.wqe_shift;
+	wq_out->rq.offset = mqp->rq.offset;
+
+	return 0;
+}
+
+int mlx4dv_init_obj(struct mlx4dv_obj *obj, uint64_t obj_type)
+{
+	int ret = 0;
+
+	if (obj_type & MLX4DV_OBJ_QP)
+		ret = mlx4dv_get_qp(obj->qp.in, obj->qp.out);
+	if (!ret && (obj_type & MLX4DV_OBJ_CQ))
+		ret = mlx4dv_get_cq(obj->cq.in, obj->cq.out);
+	if (!ret && (obj_type & MLX4DV_OBJ_SRQ))
+		ret = mlx4dv_get_srq(obj->srq.in, obj->srq.out);
+	if (!ret && (obj_type & MLX4DV_OBJ_RWQ))
+		ret = mlx4dv_get_rwq(obj->rwq.in, obj->rwq.out);
+
+	return ret;
+}
+
+int mlx4dv_query_device(struct ibv_context *ctx_in,
+			struct mlx4dv_context *attrs_out)
+{
+	struct mlx4_context *mctx = to_mctx(ctx_in);
+
+	attrs_out->version   = 0;
+	attrs_out->comp_mask = 0;
+
+	attrs_out->max_inl_recv_sz = mctx->max_inl_recv_sz;
+
+	return 0;
+}
+
+int mlx4dv_set_context_attr(struct ibv_context *context,
+			    enum mlx4dv_set_ctx_attr_type attr_type,
+			    void *attr)
+{
+	struct mlx4_context *ctx = to_mctx(context);
+
+	switch (attr_type) {
+	case MLX4DV_SET_CTX_ATTR_LOG_WQS_RANGE_SZ:
+		ctx->log_wqs_range_sz = *((uint8_t *)attr);
+		break;
+	default:
+		return ENOTSUP;
+	}
+
+	return 0;
 }

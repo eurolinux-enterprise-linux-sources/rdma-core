@@ -150,7 +150,8 @@ enum {
 };
 
 enum {
-	MLX5_CSUM_SUPPORT_RAW_OVER_ETH  = (1 <<  0),
+	MLX5_CSUM_SUPPORT_RAW_OVER_ETH  = (1 << 0),
+	MLX5_CSUM_SUPPORT_UNDERLAY_UD   = (1 << 1),
 	/*
 	 * Only report rx checksum when the validation
 	 * is valid.
@@ -164,6 +165,7 @@ enum mlx5_alloc_type {
 	MLX5_ALLOC_TYPE_CONTIG,
 	MLX5_ALLOC_TYPE_PREFER_HUGE,
 	MLX5_ALLOC_TYPE_PREFER_CONTIG,
+	MLX5_ALLOC_TYPE_EXTERNAL,
 	MLX5_ALLOC_TYPE_ALL
 };
 
@@ -178,6 +180,16 @@ enum mlx5_rsc_type {
 enum {
 	MLX5_USER_CMDS_SUPP_UHW_QUERY_DEVICE = 1 << 0,
 	MLX5_USER_CMDS_SUPP_UHW_CREATE_AH    = 1 << 1,
+};
+
+enum mlx5_vendor_cap_flags {
+	MLX5_VENDOR_CAP_FLAGS_MPW		= 1 << 0, /* Obsoleted */
+	MLX5_VENDOR_CAP_FLAGS_MPW_ALLOWED	= 1 << 1,
+	MLX5_VENDOR_CAP_FLAGS_ENHANCED_MPW	= 1 << 2,
+};
+
+enum {
+	MLX5_FLOW_TAG_MASK	= 0x000fffff,
 };
 
 struct mlx5_resource {
@@ -228,7 +240,6 @@ struct mlx5_context {
 	pthread_mutex_t                 uidx_table_mutex;
 
 	void			       *uar[MLX5_MAX_UARS];
-	struct mlx5_spinlock		lock32;
 	struct mlx5_db_page	       *db_list;
 	pthread_mutex_t			db_list_mutex;
 	int				cache_line_size;
@@ -258,6 +269,9 @@ struct mlx5_context {
 	struct ibv_tso_caps		cached_tso_caps;
 	int				cmds_supp_uhw;
 	uint32_t			uar_size;
+	uint64_t			vendor_cap_flags; /* Use enum mlx5_vendor_cap_flags */
+	struct mlx5dv_cqe_comp_caps	cqe_comp_caps;
+	struct mlx5dv_ctx_allocators	extern_alloc;
 };
 
 struct mlx5_bitmap {
@@ -315,7 +329,7 @@ struct mlx5_cq {
 	struct mlx5_spinlock		lock;
 	uint32_t			cqn;
 	uint32_t			cons_index;
-	uint32_t		       *dbrec;
+	__be32			       *dbrec;
 	int				arm_sn;
 	int				cqe_sz;
 	int				resize_cqe_sz;
@@ -343,7 +357,7 @@ struct mlx5_srq {
 	int				wqe_shift;
 	int				head;
 	int				tail;
-	uint32_t		       *db;
+	__be32			       *db;
 	uint16_t			counter;
 	int				wq_sig;
 };
@@ -376,12 +390,17 @@ struct mlx5_bf {
 	unsigned			offset;
 	unsigned			buf_size;
 	unsigned			uuarn;
+	off_t				uar_mmap_offset;
 };
 
 struct mlx5_mr {
 	struct ibv_mr			ibv_mr;
 	struct mlx5_buf			buf;
 	uint32_t			alloc_flags;
+};
+
+enum mlx5_qp_flags {
+	MLX5_QP_FLAGS_USE_UNDERLAY = 0x01,
 };
 
 struct mlx5_qp {
@@ -401,7 +420,7 @@ struct mlx5_qp {
 	uint8_t	                        sq_signal_bits;
 	struct mlx5_wq                  sq;
 
-	uint32_t                       *db;
+	__be32                         *db;
 	struct mlx5_wq                  rq;
 	int                             wq_sig;
 	uint32_t			qp_cap_cache;
@@ -409,6 +428,7 @@ struct mlx5_qp {
 	uint32_t			max_tso;
 	uint16_t			max_tso_header;
 	int                             rss_qp;
+	uint32_t			flags; /* Use enum mlx5_qp_flags */
 };
 
 struct mlx5_ah {
@@ -423,9 +443,9 @@ struct mlx5_rwq {
 	struct mlx5_buf buf;
 	int buf_size;
 	struct mlx5_wq rq;
-	uint32_t *db;
+	__be32  *db;
 	void	*pbuff;
-	uint32_t	*recv_db;
+	__be32	*recv_db;
 	int wq_sig;
 };
 
@@ -547,13 +567,18 @@ int mlx5_alloc_prefered_buf(struct mlx5_context *mctx,
 			    enum mlx5_alloc_type alloc_type,
 			    const char *component);
 int mlx5_free_actual_buf(struct mlx5_context *ctx, struct mlx5_buf *buf);
-void mlx5_get_alloc_type(const char *component,
+void mlx5_get_alloc_type(struct mlx5_context *context,
+			 const char *component,
 			 enum mlx5_alloc_type *alloc_type,
 			 enum mlx5_alloc_type default_alloc_type);
 int mlx5_use_huge(const char *key);
+bool mlx5_is_extern_alloc(struct mlx5_context *context);
+int mlx5_alloc_buf_extern(struct mlx5_context *ctx, struct mlx5_buf *buf,
+			  size_t size);
+void mlx5_free_buf_extern(struct mlx5_context *ctx, struct mlx5_buf *buf);
 
-uint32_t *mlx5_alloc_dbrec(struct mlx5_context *context);
-void mlx5_free_db(struct mlx5_context *context, uint32_t *db);
+__be32 *mlx5_alloc_dbrec(struct mlx5_context *context);
+void mlx5_free_db(struct mlx5_context *context, __be32 *db);
 
 int mlx5_query_device(struct ibv_context *context,
 		       struct ibv_device_attr *attr);

@@ -24,6 +24,10 @@
 #      Use the historical search path for providers, in the standard system library.
 #  -DKERNEL_DIR='.../linux' (default '')
 #      If set use the kernel UAPI headers from this kernel source tree.
+#  -DNO_COMPAT_SYMS=1 (default disabled)
+#      Do not generate backwards compatibility symbols in the shared
+#      libraries. This may is necessary if using a dynmic linker that does
+#      not support symbol versions, such as uclibc.
 
 cmake_minimum_required(VERSION 2.8.11 FATAL_ERROR)
 project(rdma-core C)
@@ -44,7 +48,12 @@ endif()
 set(PACKAGE_NAME "RDMA")
 
 # See Documentation/versioning.md
-set(PACKAGE_VERSION "13")
+set(PACKAGE_VERSION "15")
+# When this is changed the values in these files need changing too:
+#   debian/libibverbs1.symbols
+#   libibverbs/libibverbs.map
+set(IBVERBS_PABI_VERSION "15")
+set(IBVERBS_PROVIDER_SUFFIX "-rdmav${IBVERBS_PABI_VERSION}.so")
 
 #-------------------------
 # Basic standard paths
@@ -69,6 +78,8 @@ set(CMAKE_INSTALL_INITDDIR "${CMAKE_INSTALL_SYSCONFDIR}/init.d"
   CACHE PATH "Location for init.d files")
 set(CMAKE_INSTALL_SYSTEMD_SERVICEDIR "${CMAKE_INSTALL_PREFIX}/lib/systemd/system"
   CACHE PATH "Location for systemd service files")
+set(CMAKE_INSTALL_SYSTEMD_BINDIR "/lib/systemd"
+  CACHE PATH "Location for systemd extra binaries")
 
 set(ACM_PROVIDER_DIR "${CMAKE_INSTALL_FULL_LIBDIR}/ibacm"
   CACHE PATH "Location for ibacm provider plugin shared library files.")
@@ -181,6 +192,19 @@ set(NO_STRICT_ALIASING_FLAGS "")
 RDMA_AddOptCFlag(NO_STRICT_ALIASING_FLAGS HAVE_NO_STRICT_ALIASING
   "-fno-strict-aliasing")
 
+CHECK_C_SOURCE_COMPILES("
+ #include <unistd.h>
+
+ void entry(void);
+
+ static void do_entry(void) {}
+ void entry(void) __attribute__((ifunc(\"resolve_entry\")));
+ static void *resolve_entry(void) {return &do_entry;}
+
+ int main(int argc,const char *argv[]) { entry(); }"
+  HAVE_FUNC_ATTRIBUTE_IFUNC
+  FAIL_REGEX "warning")
+
 # The code does not do the racy fcntl if the various CLOEXEC's are not
 # supported so it really doesn't work right if this isn't available. Thus hard
 # require it.
@@ -194,6 +218,26 @@ CHECK_C_SOURCE_COMPILES("
     socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     return 0;
  }" HAS_CLOEXEC)
+
+if (NOT HAS_CLOEXEC)
+# At least uclibc wrongly hides this POSIX constant behind _GNU_SOURCE
+CHECK_C_SOURCE_COMPILES("
+ #define _GNU_SOURCE
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <sys/socket.h>
+ #include <fcntl.h>
+ int main(int argc,const char *argv[]) {
+    open(\".\",O_RDONLY | O_CLOEXEC);
+    socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    return 0;
+ }" HAS_CLOEXEC_GNU_SOURCE)
+  if (HAS_CLOEXEC_GNU_SOURCE)
+    set(HAS_CLOEXEC 1)
+    add_definitions("-D_GNU_SOURCE=")
+  endif()
+endif()
+
 if (NOT HAS_CLOEXEC)
   message(FATAL_ERROR "O_CLOEXEC/SOCK_CLOEXEC/fopen(..,\"e\") support is required but not found")
 endif()
@@ -207,13 +251,10 @@ CHECK_C_SOURCE_COMPILES("
   FAIL_REGEX "warning")
 
 # Provide a shim if C11 stdatomic.h is not supported.
-# Note, when using sparse the gcc stdatomic.h produces sparse errors
-CHECK_C_SOURCE_COMPILES("
- #include <stdatomic.h>
- int main(int argc,const char *argv[]) { return 0; }"
-  HAVE_STDATOMIC
-  FAIL_REGEX "error")
-RDMA_DoFixup("${HAVE_STDATOMIC}" "stdatomic.h")
+if (NOT HAVE_SPARSE)
+  CHECK_INCLUDE_FILE("stdatomic.h" HAVE_STDATOMIC)
+  RDMA_DoFixup("${HAVE_STDATOMIC}" "stdatomic.h")
+endif()
 
 # Enable development support features
 # Prune unneeded shared libraries during linking
@@ -232,6 +273,11 @@ RDMA_AddOptLDFlag(CMAKE_SHARED_LINKER_FLAGS SUPPORTS_NO_UNDEFINED "-Wl,--no-unde
 
 # Verify that GNU --version-script and asm(".symver") works
 find_package(LDSymVer REQUIRED)
+if (NO_COMPAT_SYMS)
+  set(HAVE_LIMITED_SYMBOL_VERSIONS 1)
+else()
+  set(HAVE_FULL_SYMBOL_VERSIONS 1)
+endif()
 
 #-------------------------
 # Find libraries
@@ -297,6 +343,10 @@ CHECK_C_SOURCE_COMPILES("
 #include \"${CMAKE_CURRENT_SOURCE_DIR}/util/udma_barrier.h\"
  int main(int argc,const char *argv[]) {return 0;}"
   HAVE_COHERENT_DMA)
+
+find_package(Systemd)
+include_directories(${SYSTEMD_INCLUDE_DIRS})
+RDMA_DoFixup("${SYSTEMD_FOUND}" "systemd/sd-daemon.h")
 
 #-------------------------
 # Apply fixups
@@ -368,6 +418,7 @@ configure_file("${BUILDLIB}/config.h.in" "${BUILD_INCLUDE}/config.h" ESCAPE_QUOT
 add_subdirectory(ccan)
 add_subdirectory(util)
 add_subdirectory(Documentation)
+add_subdirectory(kernel-boot)
 # Libraries
 add_subdirectory(libibumad)
 add_subdirectory(libibumad/man)
@@ -379,15 +430,17 @@ add_subdirectory(libibcm)
 
 # Providers
 if (HAVE_COHERENT_DMA)
-add_subdirectory(providers/cxgb3)
-add_subdirectory(providers/cxgb4)
-add_subdirectory(providers/hns)
-add_subdirectory(providers/i40iw)
+add_subdirectory(providers/bnxt_re)
+add_subdirectory(providers/cxgb3) # NO SPARSE
+add_subdirectory(providers/cxgb4) # NO SPARSE
+add_subdirectory(providers/hns) # NO SPARSE
+add_subdirectory(providers/i40iw) # NO SPARSE
 add_subdirectory(providers/mlx4)
+add_subdirectory(providers/mlx4/man)
 add_subdirectory(providers/mlx5)
 add_subdirectory(providers/mlx5/man)
 add_subdirectory(providers/mthca)
-add_subdirectory(providers/nes)
+add_subdirectory(providers/nes) # NO SPARSE
 add_subdirectory(providers/ocrdma)
 add_subdirectory(providers/qedr)
 add_subdirectory(providers/vmw_pvrdma)
@@ -399,7 +452,7 @@ add_subdirectory(providers/rxe)
 add_subdirectory(providers/rxe/man)
 
 # Binaries
-add_subdirectory(ibacm)
+add_subdirectory(ibacm) # NO SPARSE
 if (NOT NL_KIND EQUAL 0)
   add_subdirectory(iwpmd)
 endif()
@@ -421,8 +474,11 @@ message(STATUS "Missing Optional Items:")
 if (NOT HAVE_FUNC_ATTRIBUTE_ALWAYS_INLINE)
   message(STATUS " Compiler attribute always_inline NOT supported")
 endif()
+if (NOT HAVE_FUNC_ATTRIBUTE_IFUNC)
+  message(STATUS " Compiler attribute ifunc NOT supported")
+endif()
 if (NOT HAVE_COHERENT_DMA)
-  message(STATUS " Architecture NOT able to do coherent DMA (check libibverbs/arch.h) some providers disabled!")
+  message(STATUS " Architecture NOT able to do coherent DMA (check util/udma_barrier.h) some providers disabled!")
 endif()
 if (NOT HAVE_STDATOMIC)
   message(STATUS " C11 stdatomic.h NOT available (old compiler)")
@@ -442,6 +498,9 @@ else()
   if (NOT HAVE_WORKING_IF_H)
     message(STATUS " netlink/route/link.h and net/if.h NOT co-includable (old headers)")
   endif()
+endif()
+if (NOT SYSTEMD_FOUND)
+  message(STATUS " libsystemd NOT found (disabling features)")
 endif()
 if (NOT UDEV_FOUND)
   message(STATUS " libudev NOT found (disabling features)")
